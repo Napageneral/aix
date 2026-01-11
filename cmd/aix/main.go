@@ -554,7 +554,7 @@ func searchCmd() *cobra.Command {
 				model = os.Getenv("AIX_EMBED_MODEL")
 			}
 			if model == "" {
-				model = "gemini-embedding-1"
+				model = "text-embedding-004"
 			}
 			if limit <= 0 {
 				limit = 10
@@ -673,7 +673,7 @@ func searchCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&project, "project", "p", "", "Filter results to project")
 	cmd.Flags().IntVarP(&limit, "limit", "n", 10, "Maximum number of results")
-	cmd.Flags().StringVar(&model, "model", "", "Embedding model (default: AIX_EMBED_MODEL or gemini-embedding-1)")
+	cmd.Flags().StringVar(&model, "model", "", "Embedding model (default: AIX_EMBED_MODEL or text-embedding-004)")
 
 	return cmd
 }
@@ -719,7 +719,7 @@ func embedCmd() *cobra.Command {
 				model = os.Getenv("AIX_EMBED_MODEL")
 			}
 			if model == "" {
-				model = "gemini-embedding-1"
+				model = "text-embedding-004"
 			}
 
 			database, err := db.Open()
@@ -811,7 +811,7 @@ func embedCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&model, "model", "", "Embedding model (default: AIX_EMBED_MODEL or gemini-embedding-1)")
+	cmd.Flags().StringVar(&model, "model", "", "Embedding model (default: AIX_EMBED_MODEL or text-embedding-004)")
 	cmd.Flags().IntVar(&limit, "limit", 5000, "Maximum number of messages to embed")
 
 	return cmd
@@ -879,7 +879,7 @@ func computeEmbedCmd() *cobra.Command {
 				model = os.Getenv("AIX_EMBED_MODEL")
 			}
 			if model == "" {
-				model = "gemini-embedding-1"
+				model = "text-embedding-004"
 			}
 			if batchSize <= 0 {
 				batchSize = 50
@@ -1089,7 +1089,7 @@ func computeEmbedCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&model, "model", "", "Embedding model (default: AIX_EMBED_MODEL or gemini-embedding-1)")
+	cmd.Flags().StringVar(&model, "model", "", "Embedding model (default: AIX_EMBED_MODEL or text-embedding-004)")
 	cmd.Flags().IntVar(&limit, "limit", 5000, "Max messages to enqueue")
 	cmd.Flags().IntVar(&batchSize, "batch-size", 50, "Messages per embedding job")
 	cmd.Flags().IntVar(&workers, "workers", 20, "Concurrent workers")
