@@ -1,12 +1,13 @@
 # aix 🧠
 
-AI session intelligence - search and analyze your AI conversation history.
+AI session intelligence - search and analyze your AI conversation history from multiple sources.
 
-`aix` reads directly from Cursor's internal database, exports raw sessions for durability, and provides queryable storage with semantic search capabilities.
+`aix` reads directly from AI harness databases (Cursor, Claude Code CLI, Codex CLI, Claude Desktop, OpenCode), exports raw sessions for durability, and provides queryable storage with semantic search capabilities.
 
 ## Features
 
-- **Direct Cursor sync** - Reads from Cursor's SQLite DB (handles new sharded format)
+- **Multi-source sync** - Cursor, Claude Code CLI, Codex CLI, Claude Desktop, OpenCode
+- **Direct database access** - Reads directly from each tool's internal storage
 - **Durable export** - Exports raw sessions to `~/nexus/home/sessions/` for git-tracking
 - **Model tracking** - Captures which AI model was used for each session
 - **Rich metadata extraction** - Capabilities, lints, file references, code blocks
@@ -31,16 +32,19 @@ make install
 ## Quick Start
 
 ```bash
-# Initialize and sync from Cursor
+# Initialize and sync from all sources
 aix init
-aix sync --source cursor
+aix sync --all                        # Sync from all available sources
+aix sync --source cursor              # Or sync from specific source
 
 # Browse your sessions
 aix sessions --today
+aix sessions --source claude-code     # Filter by source
 aix show <session-id>
 aix stats
 
 # Query directly
+aix db query "SELECT source, COUNT(*) as sessions FROM sessions GROUP BY source"
 aix db query "SELECT model, COUNT(*) as sessions FROM sessions GROUP BY model ORDER BY sessions DESC"
 
 # Semantic search (requires GEMINI_API_KEY)
@@ -49,13 +53,32 @@ aix embed --limit 10000
 aix search "how to fix TypeScript errors"
 ```
 
+## Supported Sources
+
+| Source | Tool | Data Location | Status |
+|--------|------|---------------|--------|
+| `cursor` | Cursor IDE | `~/Library/Application Support/Cursor/.../state.vscdb` | Full messages |
+| `claude-code` | Claude Code CLI | `~/.claude/projects/` (JSONL files) | Full messages |
+| `codex` | Anthropic Codex CLI | `~/.codex/sessions/` (JSONL files) | Full messages |
+| `opencode` | OpenCode | `~/.local/share/opencode/storage/` | Full messages |
+| `claude` | Claude Desktop | `~/Library/Application Support/Claude/claude-code-sessions/` | Metadata only* |
+
+*Claude Desktop stores messages in LevelDB. Currently only session metadata (title, model, timestamps) is extracted.
+
+### Coming Soon (PRs Welcome)
+
+- **ChatGPT Desktop** - Files exist but use encrypted/proprietary format
+- **Aider** - If you use it, let us know where sessions are stored
+- **Continue** - VS Code extension
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `aix init` | Initialize config and database |
-| `aix sync --source cursor` | Sync from Cursor (exports + imports) |
-| `aix sessions` | List sessions (filters: --project, --today, --week) |
+| `aix sync --source <src>` | Sync from source (cursor, claude-code, codex, claude, opencode) |
+| `aix sync --all` | Sync from all available sources |
+| `aix sessions` | List sessions (filters: --project, --source, --today, --week) |
 | `aix show <id>` | View session details (partial ID ok) |
 | `aix db query <sql>` | Run SQL queries (SELECT only) |
 | `aix stats` | Show database statistics |
@@ -67,15 +90,15 @@ All commands support `--json` for machine-readable output.
 ## Data Flow
 
 ```
-Cursor DB (9.9GB)
-    │
-    ▼
-~/nexus/home/sessions/     ◄── Git-tracked, portable
-    │   composer/*.json       (session metadata)
-    │   bubbles/*/*.json      (message content)
-    │
-    ▼
-aix.db (3.3GB)             ◄── Analysis database (rehydratable)
+Source DBs                   Export Path                    Analysis DB
+───────────                  ───────────                    ───────────
+Cursor DB (SQLite)  ──┐
+Claude Code CLI     ──┼──►  ~/nexus/home/sessions/  ──►    aix.db
+Codex CLI           ──┤        cursor/                     (queryable)
+Claude Desktop      ──┤        claude-code/
+OpenCode (JSON)     ──┘        codex/
+                               claude/
+                               opencode/
 ```
 
 ### Storage Locations
@@ -91,20 +114,24 @@ The `aix.db` can always be rebuilt from the exported sessions.
 ### Sample Stats
 
 ```
-Sessions:        1,958
-Messages:        220,039
-File references: 15,342
-Projects:        41
-Models:          18 (claude-4.5-opus-high-thinking, gpt-5-high, etc.)
-Date range:      Aug 2024 - Jan 2026
+Sessions:        2,065
+Messages:        223,615
+File references: 15,351
+Projects:        42
+By source:
+  cursor:      1,958
+  claude-code: 100
+  codex:       4
+  opencode:    2
+  claude:      1
 ```
 
 ## Requirements
 
 - macOS or Linux
 - Go 1.22+ (for building from source)
-- Cursor (for session data)
-- `GEMINI_API_KEY` (optional, for semantic search with `gemini-embedding-1`)
+- At least one AI tool (Cursor, Claude Code CLI, Codex, Claude Desktop, or OpenCode)
+- `GEMINI_API_KEY` (optional, for semantic search)
 
 ## Related
 

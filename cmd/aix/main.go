@@ -149,20 +149,29 @@ func syncCmd() *cobra.Command {
 	var source string
 	var noExport bool
 	var exportPath string
+	var all bool
 
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync sessions from source",
-		Long: `Import AI sessions from various sources (cursor, claude, chatgpt).
+		Long: `Import AI sessions from various sources.
 
-For Cursor, reads directly from Cursor's database and exports raw JSON to
-~/nexus/home/sessions/ for durability before importing into aix.db.`,
+Supported sources:
+  cursor      - Cursor IDE sessions (reads from Cursor's SQLite database)
+  codex       - Anthropic Codex CLI sessions (~/.codex/sessions/)
+  claude-code - Claude Code CLI sessions (~/.claude/projects/)
+  claude      - Claude Desktop app sessions (metadata only, messages in LevelDB)
+  opencode    - OpenCode sessions (~/.local/share/opencode/storage/)
+  all         - Sync from all available sources
+
+Sessions are exported to ~/nexus/home/sessions/ for durability before importing.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			start := time.Now()
 
-			// Default to cursor if not specified
-			if source == "" {
-				source = "cursor"
+			// Determine which sources to sync
+			sources := []string{source}
+			if all || source == "all" {
+				sources = []string{"cursor", "codex", "claude-code", "claude", "opencode"}
 			}
 
 			// Open database
@@ -172,30 +181,95 @@ For Cursor, reads directly from Cursor's database and exports raw JSON to
 			}
 			defer database.Close()
 
-			var synced, newCount, updated, errors int
-			var exportStats *sync.ExportStats
+			totalSynced, totalNew, totalUpdated, totalErrors := 0, 0, 0, 0
+			sourceResults := make(map[string]map[string]interface{})
 
-			switch source {
-			case "cursor":
+			for _, src := range sources {
+				var synced, newCount, updated, errors int
+				var exportStats *sync.ExportStats
 				var sessions []*sync.ParsedSession
 				var errs []error
 
-				// Always read directly from Cursor's database
-				dbPath := sync.DefaultCursorDBPath()
-				parser := sync.NewCursorDBParser(dbPath)
+				switch src {
+				case "cursor":
+					dbPath := sync.DefaultCursorDBPath()
+					parser := sync.NewCursorDBParser(dbPath)
 
-				// Export to nexus for durability (unless disabled)
-				if !noExport {
-					expPath := exportPath
-					if expPath == "" {
-						expPath = sync.DefaultNexusSessionsPath()
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
 					}
-					parser.WithExport(expPath)
-					exportStats = &sync.ExportStats{}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				case "codex":
+					parser := sync.NewCodexParser("")
+
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
+					}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				case "claude-code":
+					parser := sync.NewClaudeCodeParser("")
+
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
+					}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				case "claude":
+					parser := sync.NewClaudeParser("")
+
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
+					}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				case "opencode":
+					parser := sync.NewOpenCodeParser("")
+
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
+					}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				default:
+					if !jsonOutput {
+						fmt.Fprintf(os.Stderr, "Skipping unsupported source: %s\n", src)
+					}
+					continue
 				}
 
-				sessions, errs = parser.ParseAllWithStats(exportStats)
-
+				// Process sessions
 				for _, ps := range sessions {
 					isNew, err := database.UpsertSession(&ps.Session, ps.RawJSON)
 					if err != nil {
@@ -239,7 +313,7 @@ For Cursor, reads directly from Cursor's database and exports raw JSON to
 						}
 					}
 
-					// Insert flattened capabilities and lints
+					// Insert flattened capabilities and lints (Cursor-specific)
 					for _, c := range ps.Capabilities {
 						if err := database.InsertMessageCapability(c.MessageID, c.SessionID, c.Phase, c.Capability); err != nil {
 							errors++
@@ -292,47 +366,70 @@ For Cursor, reads directly from Cursor's database and exports raw JSON to
 
 				errors += len(errs)
 
-			default:
-				return fmt.Errorf("unsupported source: %s (supported: cursor)", source)
+				// Store results for this source
+				result := map[string]interface{}{
+					"synced":  synced,
+					"new":     newCount,
+					"updated": updated,
+					"errors":  errors,
+				}
+				if exportStats != nil {
+					result["exported"] = map[string]int{
+						"session_files": exportStats.ComposerFiles,
+						"message_files": exportStats.BubbleFiles,
+					}
+				}
+				sourceResults[src] = result
+
+				totalSynced += synced
+				totalNew += newCount
+				totalUpdated += updated
+				totalErrors += errors
 			}
 
 			duration := time.Since(start)
 
 			if jsonOutput {
 				result := map[string]interface{}{
-					"source":      source,
-					"synced":      synced,
-					"new":         newCount,
-					"updated":     updated,
-					"errors":      errors,
+					"sources":     sourceResults,
+					"total":       totalSynced,
+					"new":         totalNew,
+					"updated":     totalUpdated,
+					"errors":      totalErrors,
 					"duration_ms": duration.Milliseconds(),
-				}
-				if exportStats != nil {
-					result["exported"] = map[string]int{
-						"composer_files": exportStats.ComposerFiles,
-						"bubble_files":   exportStats.BubbleFiles,
-					}
 				}
 				printJSON(result)
 			} else {
-				fmt.Printf("✓ Synced %d sessions from %s\n", synced, source)
-				fmt.Printf("  New: %d, Updated: %d, Errors: %d\n", newCount, updated, errors)
-				if exportStats != nil {
+				for src, res := range sourceResults {
+					synced := res["synced"].(int)
+					newCount := res["new"].(int)
+					updated := res["updated"].(int)
+					errors := res["errors"].(int)
+					fmt.Printf("✓ %s: %d sessions (new: %d, updated: %d, errors: %d)\n", src, synced, newCount, updated, errors)
+					if exp, ok := res["exported"].(map[string]int); ok && (exp["session_files"] > 0 || exp["message_files"] > 0) {
+						fmt.Printf("  Exported: %d session files, %d message files\n", exp["session_files"], exp["message_files"])
+					}
+				}
+				if len(sources) > 1 {
+					fmt.Printf("\nTotal: %d sessions synced in %v\n", totalSynced, duration.Round(time.Millisecond))
+				} else {
+					fmt.Printf("Duration: %v\n", duration.Round(time.Millisecond))
+				}
+				if !noExport {
 					expPath := exportPath
 					if expPath == "" {
 						expPath = sync.DefaultNexusSessionsPath()
 					}
-					fmt.Printf("  Exported: %d composer files, %d bubble files\n", exportStats.ComposerFiles, exportStats.BubbleFiles)
-					fmt.Printf("  Export path: %s\n", expPath)
+					fmt.Printf("Export path: %s\n", expPath)
 				}
-				fmt.Printf("  Duration: %v\n", duration.Round(time.Millisecond))
 			}
 
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVarP(&source, "source", "s", "cursor", "Data source (cursor, claude, chatgpt)")
+	cmd.Flags().StringVarP(&source, "source", "s", "cursor", "Data source (cursor, codex, claude-code, claude, opencode, all)")
+	cmd.Flags().BoolVar(&all, "all", false, "Sync from all available sources")
 	cmd.Flags().BoolVar(&noExport, "no-export", false, "Skip exporting raw sessions to nexus (not recommended)")
 	cmd.Flags().StringVar(&exportPath, "export-path", "", "Custom export path (default: ~/nexus/home/sessions)")
 
@@ -384,6 +481,7 @@ func dbCmd() *cobra.Command {
 
 func sessionsCmd() *cobra.Command {
 	var project string
+	var source string
 	var today bool
 	var week bool
 	var limit int
@@ -407,7 +505,7 @@ func sessionsCmd() *cobra.Command {
 				since = time.Now().AddDate(0, 0, -7).UnixMilli()
 			}
 
-			sessions, err := database.ListSessions(project, since, until, limit)
+			sessions, err := database.ListSessionsFiltered(project, source, since, until, limit)
 			if err != nil {
 				return fmt.Errorf("failed to list sessions: %w", err)
 			}
@@ -429,8 +527,12 @@ func sessionsCmd() *cobra.Command {
 					if proj == "" {
 						proj = "-"
 					}
-					fmt.Printf("%s  %-20s  %3d msgs  %s\n",
-						s.ID[:8], truncate(proj, 20), s.MessageCount, ts)
+					srcLabel := s.Source
+					if srcLabel == "" {
+						srcLabel = "?"
+					}
+					fmt.Printf("%s  %-8s  %-20s  %3d msgs  %s\n",
+						s.ID[:8], srcLabel, truncate(proj, 20), s.MessageCount, ts)
 				}
 				fmt.Printf("\n%d sessions\n", len(sessions))
 			}
@@ -440,6 +542,7 @@ func sessionsCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&project, "project", "p", "", "Filter by project")
+	cmd.Flags().StringVarP(&source, "source", "s", "", "Filter by source (cursor, codex, claude, opencode)")
 	cmd.Flags().BoolVar(&today, "today", false, "Show only today's sessions")
 	cmd.Flags().BoolVar(&week, "week", false, "Show sessions from last 7 days")
 	cmd.Flags().IntVarP(&limit, "limit", "n", 50, "Maximum sessions to show")
@@ -1113,6 +1216,12 @@ func statsCmd() *cobra.Command {
 				return fmt.Errorf("failed to get stats: %w", err)
 			}
 
+			// Get source breakdown
+			sourceStats, err := database.GetSourceStats()
+			if err == nil {
+				stats["sources"] = sourceStats
+			}
+
 			if jsonOutput {
 				printJSON(stats)
 			} else {
@@ -1120,6 +1229,12 @@ func statsCmd() *cobra.Command {
 				fmt.Printf("Messages: %v\n", stats["messages"])
 				fmt.Printf("Files referenced: %v\n", stats["files_referenced"])
 				fmt.Printf("Projects: %v\n", stats["projects"])
+				if sourceStats != nil {
+					fmt.Printf("By source:\n")
+					for source, count := range sourceStats {
+						fmt.Printf("  %s: %v\n", source, count)
+					}
+				}
 				fmt.Printf("Database: %v\n", stats["db_path"])
 			}
 

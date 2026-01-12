@@ -251,12 +251,21 @@ func (db *DB) DeleteSessionFiles(sessionID string) error {
 
 // ListSessions returns sessions with optional filters
 func (db *DB) ListSessions(project string, since, until int64, limit int) ([]models.Session, error) {
+	return db.ListSessionsFiltered(project, "", since, until, limit)
+}
+
+// ListSessionsFiltered returns sessions with optional project and source filters
+func (db *DB) ListSessionsFiltered(project, source string, since, until int64, limit int) ([]models.Session, error) {
 	query := "SELECT id, source, project, model, created_at, message_count, summary FROM sessions WHERE 1=1"
 	args := []interface{}{}
 
 	if project != "" {
 		query += " AND project = ?"
 		args = append(args, project)
+	}
+	if source != "" {
+		query += " AND source = ?"
+		args = append(args, source)
 	}
 	if since > 0 {
 		query += " AND created_at >= ?"
@@ -507,6 +516,31 @@ func (db *DB) Stats() (map[string]interface{}, error) {
 	stats["db_path"] = db.path
 
 	return stats, nil
+}
+
+// GetSourceStats returns session counts by source
+func (db *DB) GetSourceStats() (map[string]int, error) {
+	rows, err := db.conn.Query(`
+		SELECT source, COUNT(*) as count 
+		FROM sessions 
+		GROUP BY source 
+		ORDER BY count DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	stats := make(map[string]int)
+	for rows.Next() {
+		var source string
+		var count int
+		if err := rows.Scan(&source, &count); err != nil {
+			return nil, err
+		}
+		stats[source] = count
+	}
+	return stats, rows.Err()
 }
 
 // GetSyncState gets a sync state value
