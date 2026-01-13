@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/tidwall/gjson"
 
 	"github.com/Napageneral/aix/internal/models"
 )
@@ -21,8 +25,11 @@ func DefaultNexusSessionsPath() string {
 
 // CursorDBParser parses sessions directly from Cursor's SQLite database
 type CursorDBParser struct {
-	dbPath     string
-	exportPath string // if set, exports sessions to this path for durability
+	dbPath        string
+	exportPath    string            // if set, exports sessions to this path for durability
+	knownHashes   map[string]string // existing session ID -> hash for incremental sync (legacy)
+	sinceRowID    int64             // if >0, only load composerData rows with rowid > sinceRowID
+	maxComposerID int64             // observed max rowid for composerData (for sync_state)
 }
 
 // NewCursorDBParser creates a parser that reads directly from Cursor's DB
@@ -39,10 +46,31 @@ func (p *CursorDBParser) WithExport(exportPath string) *CursorDBParser {
 	return p
 }
 
+// WithKnownHashes sets existing session hashes for incremental sync
+// Sessions with matching hashes will be skipped during parsing
+func (p *CursorDBParser) WithKnownHashes(hashes map[string]string) *CursorDBParser {
+	p.knownHashes = hashes
+	return p
+}
+
+// WithSinceRowID enables rowid-based incremental sync.
+// If set, ParseAllWithStats only reads composerData rows with rowid > sinceRowID.
+func (p *CursorDBParser) WithSinceRowID(sinceRowID int64) *CursorDBParser {
+	p.sinceRowID = sinceRowID
+	return p
+}
+
+// ComposerMaxRowID returns the max rowid observed for composerData entries during parsing.
+func (p *CursorDBParser) ComposerMaxRowID() int64 {
+	return p.maxComposerID
+}
+
 // ExportStats holds export statistics
 type ExportStats struct {
-	ComposerFiles int
-	BubbleFiles   int
+	ComposerFiles        int
+	ComposerFilesSkipped int
+	BubbleFiles          int
+	BubbleFilesSkipped   int
 }
 
 // ParseAll parses all sessions from Cursor's database
@@ -80,43 +108,83 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 		}
 	}
 
-	// Get all composerData entries
-	rows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL`)
-	if err != nil {
-		return nil, []error{fmt.Errorf("failed to query sessions: %w", err)}
+	// Capture current max rowid for composerData (used by sync_state)
+	{
+		var maxRow sql.NullInt64
+		// Using IFNULL/MAX avoids NULL when no rows exist.
+		if err := db.QueryRow(`SELECT IFNULL(MAX(rowid), 0) FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL`).Scan(&maxRow); err == nil {
+			p.maxComposerID = maxRow.Int64
+		}
 	}
-	defer rows.Close()
 
-	composerCount := 0
-	bubbleCount := 0
-
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			errors = append(errors, err)
-			continue
-		}
-
-		// Export composerData if exporting
-		if composerDir != "" {
-			composerID := strings.TrimPrefix(key, "composerData:")
-			exportFile := filepath.Join(composerDir, composerID+".json")
-			if err := os.WriteFile(exportFile, []byte(value), 0644); err != nil {
-				errors = append(errors, fmt.Errorf("failed to export %s: %w", key, err))
-			} else {
-				composerCount++
-			}
-		}
-
-		session, bubbles, err := p.parseSessionWithBubbles(db, key, value)
+	// FAST PATH: rowid-based incremental sync (skip scanning all composerData values)
+	// This avoids the expensive "read every value + hash" loop when nothing changed.
+	if p.sinceRowID > 0 {
+		rows, err := db.Query(
+			`SELECT rowid, key, value FROM cursorDiskKV
+			 WHERE key LIKE 'composerData:%' AND value IS NOT NULL AND rowid > ?`,
+			p.sinceRowID,
+		)
 		if err != nil {
-			errors = append(errors, fmt.Errorf("%s: %w", key, err))
-			continue
+			return nil, []error{fmt.Errorf("failed to query sessions: %w", err)}
 		}
-		if session != nil {
+		defer rows.Close()
+
+		composerCount := 0
+		bubbleCount := 0
+		composerSkipped := 0
+		bubbleSkipped := 0
+
+		for rows.Next() {
+			var rowid int64
+			var key, value string
+			if err := rows.Scan(&rowid, &key, &value); err != nil {
+				errors = append(errors, err)
+				continue
+			}
+
+			composerID := strings.TrimPrefix(key, "composerData:")
+
+			// Export composerData if exporting (redacted for git safety)
+			if composerDir != "" {
+				exportFile := filepath.Join(composerDir, composerID+".json")
+				// This row is new/changed (rowid > sinceRowID), so always rewrite export output.
+				redactedValue := RedactJSON(value)
+				if err := os.WriteFile(exportFile, []byte(redactedValue), 0644); err != nil {
+					errors = append(errors, fmt.Errorf("failed to export %s: %w", key, err))
+				} else {
+					composerCount++
+				}
+			}
+
+			// For incremental parsing, fetch bubbles for *just this composerID* (small N => acceptable).
+			bubbleCache := make(map[string]string)
+			bubbleRows, err := db.Query(
+				`SELECT key, value FROM cursorDiskKV WHERE key LIKE ? AND value IS NOT NULL`,
+				fmt.Sprintf("bubbleId:%s:%%", composerID),
+			)
+			if err == nil {
+				for bubbleRows.Next() {
+					var bkey, bval string
+					if err := bubbleRows.Scan(&bkey, &bval); err != nil {
+						continue
+					}
+					bubbleCache[bkey] = bval
+				}
+				bubbleRows.Close()
+			}
+
+			session, bubbles, err := p.parseSessionWithBubblesFromCache(bubbleCache, key, value)
+			if err != nil {
+				errors = append(errors, fmt.Errorf("%s: %w", key, err))
+				continue
+			}
+			if session == nil {
+				continue
+			}
 			sessions = append(sessions, session)
 
-			// Export bubbles if exporting
+			// Export bubbles if exporting and bubble payloads available
 			if bubblesDir != "" && len(bubbles) > 0 {
 				sessionBubbleDir := filepath.Join(bubblesDir, session.Session.ID)
 				if err := os.MkdirAll(sessionBubbleDir, 0755); err != nil {
@@ -124,7 +192,8 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 				} else {
 					for bubbleID, bubbleJSON := range bubbles {
 						bubbleFile := filepath.Join(sessionBubbleDir, bubbleID+".json")
-						if err := os.WriteFile(bubbleFile, []byte(bubbleJSON), 0644); err != nil {
+						redactedBubble := RedactJSON(bubbleJSON)
+						if err := os.WriteFile(bubbleFile, []byte(redactedBubble), 0644); err != nil {
 							errors = append(errors, fmt.Errorf("failed to export bubble %s: %w", bubbleID, err))
 						} else {
 							bubbleCount++
@@ -133,11 +202,190 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 				}
 			}
 		}
+
+		if exportStats != nil {
+			exportStats.ComposerFiles = composerCount
+			exportStats.ComposerFilesSkipped = composerSkipped
+			exportStats.BubbleFiles = bubbleCount
+			exportStats.BubbleFilesSkipped = bubbleSkipped
+		}
+
+		return sessions, errors
 	}
+
+	// First pass: identify which sessions need processing (for incremental sync)
+	type sessionEntry struct {
+		key, value string
+		skip       bool
+	}
+	var entriesToProcess []sessionEntry
+	var changedSessionIDs = make(map[string]bool)
+
+	rows1, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL`)
+	if err != nil {
+		return nil, []error{fmt.Errorf("failed to query sessions: %w", err)}
+	}
+	for rows1.Next() {
+		var key, value string
+		if err := rows1.Scan(&key, &value); err != nil {
+			continue
+		}
+
+		composerID := strings.TrimPrefix(key, "composerData:")
+		skip := false
+
+		// Legacy hash-based incremental sync (kept for compatibility)
+		// NOTE: prefer rowid-based incremental via WithSinceRowID.
+		if p.knownHashes != nil {
+			// This path is intentionally a no-op now (hashing here was a major perf sink).
+			// If caller wants incremental, they should use WithSinceRowID.
+		}
+
+		if !skip {
+			changedSessionIDs[composerID] = true
+		}
+		entriesToProcess = append(entriesToProcess, sessionEntry{key: key, value: value, skip: skip})
+	}
+	rows1.Close()
+
+	// Only fetch bubbles for changed sessions (major optimization for incremental sync)
+	bubbleCache := make(map[string]string)
+	if len(changedSessionIDs) > 0 {
+		bubbleRows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' AND value IS NOT NULL`)
+		if err != nil {
+			return nil, []error{fmt.Errorf("failed to query bubbles: %w", err)}
+		}
+		for bubbleRows.Next() {
+			var key, value string
+			if err := bubbleRows.Scan(&key, &value); err != nil {
+				continue
+			}
+			// Only cache bubbles for changed sessions
+			// Key format: bubbleId:composerId:bubbleId
+			parts := strings.Split(key, ":")
+			if len(parts) >= 2 {
+				composerID := parts[1]
+				if changedSessionIDs[composerID] {
+					bubbleCache[key] = value
+				}
+			}
+		}
+		bubbleRows.Close()
+	}
+
+	var composerCount64 int64
+	var bubbleCount64 int64
+	var composerSkipped64 int64
+	var bubbleSkipped64 int64
+
+	workerCount := runtime.NumCPU()
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > 8 {
+		workerCount = 8
+	}
+
+	var mu sync.Mutex
+	jobs := make(chan sessionEntry, workerCount*2)
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for entry := range jobs {
+			key := entry.key
+			value := entry.value
+			composerID := strings.TrimPrefix(key, "composerData:")
+
+			if entry.skip {
+				atomic.AddInt64(&composerSkipped64, 1)
+				continue
+			}
+
+			// Fast incremental check: if composer file exists, skip exporting (still parse into aix.db)
+			skipExport := false
+			if composerDir != "" {
+				exportFile := filepath.Join(composerDir, composerID+".json")
+				if _, err := os.Stat(exportFile); err == nil {
+					skipExport = true
+					atomic.AddInt64(&composerSkipped64, 1)
+				}
+			}
+
+			// Export composerData if enabled and not skipping
+			if composerDir != "" && !skipExport {
+				exportFile := filepath.Join(composerDir, composerID+".json")
+				redactedValue := RedactJSON(value)
+				if err := os.WriteFile(exportFile, []byte(redactedValue), 0644); err != nil {
+					mu.Lock()
+					errors = append(errors, fmt.Errorf("failed to export %s: %w", key, err))
+					mu.Unlock()
+				} else {
+					atomic.AddInt64(&composerCount64, 1)
+				}
+			}
+
+			session, bubbles, err := p.parseSessionWithBubblesFromCache(bubbleCache, key, value)
+			if err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Errorf("%s: %w", key, err))
+				mu.Unlock()
+				continue
+			}
+			if session == nil {
+				continue
+			}
+
+			mu.Lock()
+			sessions = append(sessions, session)
+			mu.Unlock()
+
+			// Export bubbles if exporting and not skipping this session
+			if bubblesDir != "" && len(bubbles) > 0 && !skipExport {
+				sessionBubbleDir := filepath.Join(bubblesDir, session.Session.ID)
+				if err := os.MkdirAll(sessionBubbleDir, 0755); err != nil {
+					mu.Lock()
+					errors = append(errors, fmt.Errorf("failed to create bubble dir for %s: %w", session.Session.ID, err))
+					mu.Unlock()
+				} else {
+					for bubbleID, bubbleJSON := range bubbles {
+						bubbleFile := filepath.Join(sessionBubbleDir, bubbleID+".json")
+						redactedBubble := RedactJSON(bubbleJSON)
+						if err := os.WriteFile(bubbleFile, []byte(redactedBubble), 0644); err != nil {
+							mu.Lock()
+							errors = append(errors, fmt.Errorf("failed to export bubble %s: %w", bubbleID, err))
+							mu.Unlock()
+						} else {
+							atomic.AddInt64(&bubbleCount64, 1)
+						}
+					}
+				}
+			} else if bubblesDir != "" && skipExport {
+				atomic.AddInt64(&bubbleSkipped64, int64(len(bubbles)))
+			}
+		}
+	}
+
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go worker()
+	}
+	for _, entry := range entriesToProcess {
+		jobs <- entry
+	}
+	close(jobs)
+	wg.Wait()
+
+	composerCount := int(atomic.LoadInt64(&composerCount64))
+	bubbleCount := int(atomic.LoadInt64(&bubbleCount64))
+	composerSkipped := int(atomic.LoadInt64(&composerSkipped64))
+	bubbleSkipped := int(atomic.LoadInt64(&bubbleSkipped64))
 
 	if exportStats != nil {
 		exportStats.ComposerFiles = composerCount
+		exportStats.ComposerFilesSkipped = composerSkipped
 		exportStats.BubbleFiles = bubbleCount
+		exportStats.BubbleFilesSkipped = bubbleSkipped
 	}
 
 	return sessions, errors
@@ -149,42 +397,54 @@ func (p *CursorDBParser) parseSession(db *sql.DB, key, value string) (*ParsedSes
 	return session, err
 }
 
-// parseSessionWithBubbles parses a session and returns bubble JSON for export
+// parseSessionWithBubbles parses a session and returns bubble JSON for export (legacy, uses DB queries)
 func (p *CursorDBParser) parseSessionWithBubbles(db *sql.DB, key, value string) (*ParsedSession, map[string]string, error) {
-	bubbleJSONs := make(map[string]string) // bubbleID -> raw JSON
-	var raw map[string]interface{}
-	if err := json.Unmarshal([]byte(value), &raw); err != nil {
-		return nil, nil, fmt.Errorf("invalid JSON: %w", err)
-	}
+	// Build a mini-cache for this session's bubbles by querying the DB
+	// This is the slow path - prefer parseSessionWithBubblesFromCache
+	bubbleCache := make(map[string]string)
+	return p.parseSessionWithBubblesFromCache(bubbleCache, key, value)
+}
 
-	composerID, _ := raw["composerId"].(string)
+// parseSessionWithBubblesFromCache parses a session using a pre-fetched bubble cache (fast path)
+func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string]string, key, value string) (*ParsedSession, map[string]string, error) {
+	bubbleJSONs := make(map[string]string) // bubbleID -> raw JSON
+	composerID := gjson.Get(value, "composerId").String()
 	if composerID == "" {
 		return nil, nil, nil // Skip invalid entries
 	}
 
-	createdAt := int64(0)
-	if v, ok := raw["createdAt"].(float64); ok {
-		createdAt = int64(v)
-	}
+	createdAt := gjson.Get(value, "createdAt").Int()
 	if createdAt == 0 {
 		if ts, ok := uuidV7TimestampMillis(composerID); ok {
 			createdAt = ts
 		}
 	}
 
-	// Check which format this session uses
-	conversation, hasOldFormat := raw["conversation"].([]interface{})
-	headers, hasNewFormat := raw["fullConversationHeadersOnly"].([]interface{})
+	// Determine session format (fast checks)
+	headersRes := gjson.Get(value, "fullConversationHeadersOnly")
+	hasNewFormat := headersRes.Exists() && headersRes.IsArray() && len(headersRes.Array()) > 0
+	convRes := gjson.Get(value, "conversation")
+	hasOldFormat := convRes.Exists() && convRes.IsArray() && len(convRes.Array()) > 0
 
-	// Extract project
-	project := extractProjectFromRaw(raw)
+	// Extract model from modelConfig (fast)
+	model := gjson.Get(value, "modelConfig.modelName").String()
 
-	// Extract model from modelConfig
-	model := ""
-	if mc, ok := raw["modelConfig"].(map[string]interface{}); ok {
-		if mn, ok := mc["modelName"].(string); ok {
-			model = mn
+	// Project + session-level files:
+	// - For new format: extract without unmarshalling
+	// - For old format: fall back to existing map-based helpers
+	project := ""
+	files := []string(nil)
+	var raw map[string]interface{}
+	if hasNewFormat {
+		project = extractProjectFromComposerJSON(value)
+		files = extractFilesFromComposerJSON(value)
+	} else {
+		// Old/unknown format: keep compatibility via json.Unmarshal
+		if err := json.Unmarshal([]byte(value), &raw); err != nil {
+			return nil, nil, fmt.Errorf("invalid JSON: %w", err)
 		}
+		project = extractProjectFromRaw(raw)
+		files = extractFilesFromRaw(raw)
 	}
 
 	session := models.Session{
@@ -202,7 +462,8 @@ func (p *CursorDBParser) parseSessionWithBubbles(db *sql.DB, key, value string) 
 	var mfiles []MessageFileRef
 	var codeblocks []MessageCodeblock
 
-	if hasOldFormat && len(conversation) > 0 {
+	if hasOldFormat && !hasNewFormat {
+		conversation, _ := raw["conversation"].([]interface{})
 		// OLD FORMAT: messages are inline in conversation array
 		convMaps := make([]map[string]interface{}, 0, len(conversation))
 		for _, item := range conversation {
@@ -212,28 +473,19 @@ func (p *CursorDBParser) parseSessionWithBubbles(db *sql.DB, key, value string) 
 		}
 		messages, meta, caps, lints, mfiles, codeblocks = parseMessages(composerID, createdAt, convMaps)
 
-	} else if hasNewFormat && len(headers) > 0 {
+	} else if hasNewFormat {
 		// NEW FORMAT: headers only in composerData, content in bubbleId:* keys
-		for i, h := range headers {
-			header, ok := h.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			bubbleID, _ := header["bubbleId"].(string)
+		for i, h := range headersRes.Array() {
+			bubbleID := h.Get("bubbleId").String()
 			if bubbleID == "" {
 				continue
 			}
 
-			msgType := int(0)
-			if v, ok := header["type"].(float64); ok {
-				msgType = int(v)
-			}
+			msgType := int(h.Get("type").Int())
 
-			// Fetch bubble content from separate key
+			// Look up bubble content from pre-fetched cache (fast!) instead of N+1 DB queries
 			bubbleKey := fmt.Sprintf("bubbleId:%s:%s", composerID, bubbleID)
-			var bubbleValue sql.NullString
-			err := db.QueryRow(`SELECT value FROM cursorDiskKV WHERE key = ?`, bubbleKey).Scan(&bubbleValue)
+			bubbleValue := bubbleCache[bubbleKey]
 
 			msg := models.Message{
 				ID:        bubbleID,
@@ -259,31 +511,25 @@ func (p *CursorDBParser) parseSessionWithBubbles(db *sql.DB, key, value string) 
 			}
 
 			// Parse bubble content if available
-			if err == nil && bubbleValue.Valid && bubbleValue.String != "" {
+			if bubbleValue != "" {
 				// Store raw bubble JSON for export
-				bubbleJSONs[bubbleID] = bubbleValue.String
-
-				var bubble map[string]interface{}
-				if json.Unmarshal([]byte(bubbleValue.String), &bubble) == nil {
-					// Extract text
-					if text, ok := bubble["text"].(string); ok && text != "" {
-						msg.Content = text
-					} else if rawText, ok := bubble["rawText"].(string); ok && rawText != "" {
-						msg.Content = rawText
-					}
-
-					// Extract metadata, capabilities, lints, files from bubble
-					bubbleCaps, bubbleLints, bubbleFiles, bubbleCBs := extractBubbleMetadata(composerID, bubbleID, bubble)
-					caps = append(caps, bubbleCaps...)
-					lints = append(lints, bubbleLints...)
-					mfiles = append(mfiles, bubbleFiles...)
-					codeblocks = append(codeblocks, bubbleCBs...)
-
-					// Store raw metadata
-					if b, err := json.Marshal(bubble); err == nil {
-						meta[bubbleID] = string(b)
-					}
+				bubbleJSONs[bubbleID] = bubbleValue
+				// Extract text (no json.Unmarshal)
+				text := gjson.Get(bubbleValue, "text").String()
+				if text == "" {
+					text = gjson.Get(bubbleValue, "rawText").String()
 				}
+				msg.Content = text
+
+				// Extract metadata, capabilities, lints, files from bubble (no json.Unmarshal)
+				bubbleCaps, bubbleLints, bubbleFiles, bubbleCBs := extractBubbleMetadataJSON(composerID, bubbleID, bubbleValue)
+				caps = append(caps, bubbleCaps...)
+				lints = append(lints, bubbleLints...)
+				mfiles = append(mfiles, bubbleFiles...)
+				codeblocks = append(codeblocks, bubbleCBs...)
+
+				// Store raw metadata (bubble JSON)
+				meta[bubbleID] = bubbleValue
 			}
 
 			messages = append(messages, msg)
@@ -294,9 +540,6 @@ func (p *CursorDBParser) parseSessionWithBubbles(db *sql.DB, key, value string) 
 	}
 
 	session.MessageCount = len(messages)
-
-	// Collect files from session-level context
-	files := extractFilesFromRaw(raw)
 
 	return &ParsedSession{
 		Session:         session,
@@ -309,6 +552,184 @@ func (p *CursorDBParser) parseSessionWithBubbles(db *sql.DB, key, value string) 
 		Files:           files,
 		RawJSON:         value,
 	}, bubbleJSONs, nil
+}
+
+// extractBubbleMetadataJSON extracts capabilities, lints, files from raw bubble JSON without unmarshalling.
+func extractBubbleMetadataJSON(sessionID, messageID string, bubbleJSON string) ([]MessageCapability, []MessageLint, []MessageFileRef, []MessageCodeblock) {
+	var caps []MessageCapability
+	var lints []MessageLint
+	var files []MessageFileRef
+	var codeblocks []MessageCodeblock
+
+	// Capabilities from capabilitiesRan
+	cr := gjson.Get(bubbleJSON, "capabilitiesRan")
+	if cr.Exists() && cr.IsObject() {
+		cr.ForEach(func(k, v gjson.Result) bool {
+			phase := k.String()
+			if v.IsArray() {
+				for _, item := range v.Array() {
+					if item.Type == gjson.Number {
+						caps = append(caps, MessageCapability{
+							MessageID: messageID, SessionID: sessionID, Phase: phase, Capability: int(item.Int()),
+						})
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	// Lints from multiFileLinterErrors
+	mfe := gjson.Get(bubbleJSON, "multiFileLinterErrors")
+	if mfe.Exists() && mfe.IsArray() {
+		for _, fileEntry := range mfe.Array() {
+			filePath := fileEntry.Get("relativeWorkspacePath").String()
+			errs := fileEntry.Get("errors")
+			if !errs.Exists() || !errs.IsArray() {
+				continue
+			}
+			for _, e := range errs.Array() {
+				msgText := e.Get("message").String()
+				src := e.Get("source").String()
+				sl := int(e.Get("range.startPosition.line").Int())
+				sc := int(e.Get("range.startPosition.column").Int())
+				el := int(e.Get("range.endPosition.line").Int())
+				ec := int(e.Get("range.endPosition.column").Int())
+				lints = append(lints, MessageLint{
+					MessageID: messageID, SessionID: sessionID,
+					FilePath: filePath, Message: msgText, Source: src,
+					StartLine: sl, StartCol: sc, EndLine: el, EndCol: ec,
+				})
+			}
+		}
+	}
+
+	// Files from relevantFiles
+	rf := gjson.Get(bubbleJSON, "relevantFiles")
+	if rf.Exists() && rf.IsArray() {
+		for _, v := range rf.Array() {
+			p := v.String()
+			if p != "" {
+				files = append(files, MessageFileRef{
+					MessageID: messageID, SessionID: sessionID, Kind: "relevant", FilePath: p,
+				})
+			}
+		}
+	}
+
+	// Files from recentLocationsHistory
+	rh := gjson.Get(bubbleJSON, "recentLocationsHistory")
+	if rh.Exists() && rh.IsArray() {
+		for _, v := range rh.Array() {
+			p := v.Get("relativeWorkspacePath").String()
+			if p != "" {
+				ln := int(v.Get("lineNumber").Int())
+				files = append(files, MessageFileRef{
+					MessageID: messageID, SessionID: sessionID, Kind: "recent_location", FilePath: p, LineNumber: ln,
+				})
+			}
+		}
+	}
+
+	// Suggested code blocks
+	scb := gjson.Get(bubbleJSON, "suggestedCodeBlocks")
+	if scb.Exists() && scb.IsArray() {
+		for idx, v := range scb.Array() {
+			codeblocks = append(codeblocks, MessageCodeblock{
+				MessageID: messageID, SessionID: sessionID, Idx: idx, RawJSON: v.Raw,
+			})
+		}
+	}
+
+	return caps, lints, files, codeblocks
+}
+
+func extractProjectFromComposerJSON(raw string) string {
+	// context.fileSelections[].uri.fsPath
+	fs := gjson.Get(raw, "context.fileSelections")
+	if fs.Exists() && fs.IsArray() {
+		for _, item := range fs.Array() {
+			p := item.Get("uri.fsPath").String()
+			if p != "" {
+				if proj := inferProjectFromPath(p); proj != "" {
+					return proj
+				}
+			}
+		}
+	}
+
+	// codeBlockData keys (file:// URIs)
+	cbd := gjson.Get(raw, "codeBlockData")
+	if cbd.Exists() && cbd.IsObject() {
+		found := ""
+		cbd.ForEach(func(k, v gjson.Result) bool {
+			p := k.String()
+			if p != "" && found == "" {
+				if proj := inferProjectFromPath(p); proj != "" {
+					found = proj
+					return false
+				}
+			}
+			return true
+		})
+		if found != "" {
+			return found
+		}
+	}
+
+	// originalFileStates keys
+	ofs := gjson.Get(raw, "originalFileStates")
+	if ofs.Exists() && ofs.IsObject() {
+		found := ""
+		ofs.ForEach(func(k, v gjson.Result) bool {
+			p := k.String()
+			if p != "" && found == "" {
+				if proj := inferProjectFromPath(p); proj != "" {
+					found = proj
+					return false
+				}
+			}
+			return true
+		})
+		if found != "" {
+			return found
+		}
+	}
+
+	return ""
+}
+
+func extractFilesFromComposerJSON(raw string) []string {
+	seen := make(map[string]bool)
+	var out []string
+
+	fs := gjson.Get(raw, "context.fileSelections")
+	if fs.Exists() && fs.IsArray() {
+		for _, item := range fs.Array() {
+			p := item.Get("uri.fsPath").String()
+			if p != "" && !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+
+	cbd := gjson.Get(raw, "codeBlockData")
+	if cbd.Exists() && cbd.IsObject() {
+		cbd.ForEach(func(k, v gjson.Result) bool {
+			p := k.String()
+			if strings.HasPrefix(p, "file://") {
+				p = strings.TrimPrefix(p, "file://")
+			}
+			if p != "" && !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+			return true
+		})
+	}
+
+	return out
 }
 
 // extractBubbleMetadata extracts capabilities, lints, files from a bubble

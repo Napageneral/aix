@@ -1,6 +1,7 @@
 package db
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -76,6 +78,603 @@ func DefaultDBPath() string {
 // Close closes the database connection
 func (db *DB) Close() error {
 	return db.conn.Close()
+}
+
+// Begin starts a new transaction
+func (db *DB) Begin() (*sql.Tx, error) {
+	return db.conn.Begin()
+}
+
+// TxBatch provides transaction-aware batch operations for high-performance bulk imports
+type TxBatch struct {
+	conn                 *sql.DB
+	pragmaState          *bulkPragmaState
+	restoreOnce          sync.Once
+	tx                   *sql.Tx
+	stmtUpsertSession    *sql.Stmt
+	stmtInsertMessage    *sql.Stmt
+	stmtInsertMetadata   *sql.Stmt
+	stmtInsertCapability *sql.Stmt
+	stmtInsertLint       *sql.Stmt
+	stmtInsertMsgFile    *sql.Stmt
+	stmtInsertCodeblock  *sql.Stmt
+	stmtInsertFileRef    *sql.Stmt
+	stmtDeleteMessages   *sql.Stmt
+	stmtDeleteMetadata   *sql.Stmt
+	stmtDeleteCaps       *sql.Stmt
+	stmtDeleteLints      *sql.Stmt
+	stmtDeleteMsgFiles   *sql.Stmt
+	stmtDeleteCodeblocks *sql.Stmt
+	stmtDeleteFiles      *sql.Stmt
+}
+
+type bulkPragmaState struct {
+	synchronous    int64
+	foreignKeys    int64
+	tempStore      int64
+	cacheSize      int64
+	mmapSize       int64
+	walCheckpoint  int64
+	busyTimeout    int64
+	journalMode    string
+}
+
+func readPragmaInt(db *sql.DB, name string) (int64, error) {
+	var v sql.NullInt64
+	if err := db.QueryRow("PRAGMA "+name).Scan(&v); err != nil {
+		return 0, err
+	}
+	return v.Int64, nil
+}
+
+func readPragmaText(db *sql.DB, name string) (string, error) {
+	var v sql.NullString
+	if err := db.QueryRow("PRAGMA "+name).Scan(&v); err != nil {
+		return "", err
+	}
+	return v.String, nil
+}
+
+func captureBulkPragmaState(db *sql.DB) *bulkPragmaState {
+	st := &bulkPragmaState{}
+	if v, err := readPragmaInt(db, "synchronous"); err == nil {
+		st.synchronous = v
+	}
+	if v, err := readPragmaInt(db, "foreign_keys"); err == nil {
+		st.foreignKeys = v
+	}
+	if v, err := readPragmaInt(db, "temp_store"); err == nil {
+		st.tempStore = v
+	}
+	if v, err := readPragmaInt(db, "cache_size"); err == nil {
+		st.cacheSize = v
+	}
+	if v, err := readPragmaInt(db, "mmap_size"); err == nil {
+		st.mmapSize = v
+	}
+	if v, err := readPragmaInt(db, "wal_autocheckpoint"); err == nil {
+		st.walCheckpoint = v
+	}
+	if v, err := readPragmaInt(db, "busy_timeout"); err == nil {
+		st.busyTimeout = v
+	}
+	if v, err := readPragmaText(db, "journal_mode"); err == nil {
+		st.journalMode = v
+	}
+	return st
+}
+
+func applyBulkImportPragmas(db *sql.DB) {
+	// We prefer speed over durability during import; WAL still gives good safety.
+	// We restore previous values after commit/rollback.
+	_, _ = db.Exec("PRAGMA foreign_keys = OFF")
+	_, _ = db.Exec("PRAGMA synchronous = OFF")
+	_, _ = db.Exec("PRAGMA temp_store = MEMORY")
+	_, _ = db.Exec("PRAGMA cache_size = -200000")        // ~200MB page cache
+	_, _ = db.Exec("PRAGMA mmap_size = 268435456")       // 256MB mmap
+	_, _ = db.Exec("PRAGMA wal_autocheckpoint = 0")      // avoid checkpoint work during import
+	_, _ = db.Exec("PRAGMA busy_timeout = 5000")         // reduce transient lock errors
+	_, _ = db.Exec("PRAGMA journal_mode = WAL")          // ensure WAL
+}
+
+func restoreBulkImportPragmas(db *sql.DB, st *bulkPragmaState) {
+	if st == nil {
+		return
+	}
+	if st.journalMode != "" {
+		_, _ = db.Exec("PRAGMA journal_mode = " + st.journalMode)
+	}
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", st.busyTimeout))
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA wal_autocheckpoint = %d", st.walCheckpoint))
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA mmap_size = %d", st.mmapSize))
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA cache_size = %d", st.cacheSize))
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA temp_store = %d", st.tempStore))
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA synchronous = %d", st.synchronous))
+	_, _ = db.Exec(fmt.Sprintf("PRAGMA foreign_keys = %d", st.foreignKeys))
+}
+
+// GetSessionHashes returns a map of session ID -> SHA256 hash of raw_json for a given source
+// Used for incremental sync to detect unchanged sessions
+func (db *DB) GetSessionHashes(source string) (map[string]string, error) {
+	rows, err := db.conn.Query(`
+		SELECT id, raw_json FROM sessions WHERE source = ?
+	`, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	hashes := make(map[string]string)
+	for rows.Next() {
+		var id string
+		var rawJSON sql.NullString
+		if err := rows.Scan(&id, &rawJSON); err != nil {
+			continue
+		}
+		if rawJSON.Valid && rawJSON.String != "" {
+			// Use first 16 chars of SHA256 as quick hash
+			h := sha256.Sum256([]byte(rawJSON.String))
+			hashes[id] = fmt.Sprintf("%x", h[:8])
+		}
+	}
+	return hashes, rows.Err()
+}
+
+// DeleteSessionData deletes all data for specific session IDs
+func (db *DB) DeleteSessionDataByIDs(sessionIDs []string) error {
+	if len(sessionIDs) == 0 {
+		return nil
+	}
+
+	// Build placeholder string
+	placeholders := make([]string, len(sessionIDs))
+	args := make([]interface{}, len(sessionIDs))
+	for i, id := range sessionIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	// Delete in FK order
+	queries := []string{
+		"DELETE FROM message_metadata WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM message_capabilities WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM message_lints WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM message_files WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM message_codeblocks WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM messages WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM files_referenced WHERE session_id IN (" + inClause + ")",
+	}
+
+	for _, q := range queries {
+		if _, err := db.conn.Exec(q, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteAllSourceData deletes all messages and related data for sessions from a given source
+func (db *DB) DeleteAllSourceData(source string) error {
+	// Delete in FK order
+	_, err := db.conn.Exec(`DELETE FROM message_metadata WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM message_capabilities WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM message_lints WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM message_files WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM message_codeblocks WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM files_referenced WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// BeginBatch starts a new transaction batch for high-performance bulk imports
+func (db *DB) BeginBatch() (*TxBatch, error) {
+	// Bulk import mode pragmas (restored after commit/rollback)
+	st := captureBulkPragmaState(db.conn)
+	applyBulkImportPragmas(db.conn)
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	batch := &TxBatch{conn: db.conn, pragmaState: st, tx: tx}
+
+	// Prepare all statements for reuse
+	batch.stmtUpsertSession, err = tx.Prepare(`
+		INSERT INTO sessions (id, source, project, model, created_at, message_count, summary, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			source = excluded.source,
+			project = excluded.project,
+			model = excluded.model,
+			created_at = excluded.created_at,
+			message_count = excluded.message_count,
+			summary = excluded.summary,
+			raw_json = excluded.raw_json`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare upsert session: %w", err)
+	}
+
+	batch.stmtInsertMessage, err = tx.Prepare(`
+		INSERT OR REPLACE INTO messages (id, session_id, role, content, sequence, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert message: %w", err)
+	}
+
+	batch.stmtInsertMetadata, err = tx.Prepare(`
+		INSERT OR REPLACE INTO message_metadata (message_id, session_id, metadata_json)
+		VALUES (?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert metadata: %w", err)
+	}
+
+	batch.stmtInsertCapability, err = tx.Prepare(`
+		INSERT OR IGNORE INTO message_capabilities (message_id, session_id, phase, capability)
+		VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert capability: %w", err)
+	}
+
+	batch.stmtInsertLint, err = tx.Prepare(`
+		INSERT OR IGNORE INTO message_lints (message_id, session_id, file_path, message, source, start_line, start_col, end_line, end_col)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert lint: %w", err)
+	}
+
+	batch.stmtInsertMsgFile, err = tx.Prepare(`
+		INSERT OR IGNORE INTO message_files (message_id, session_id, kind, file_path, line_number)
+		VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert msg file: %w", err)
+	}
+
+	batch.stmtInsertCodeblock, err = tx.Prepare(`
+		INSERT OR IGNORE INTO message_codeblocks (message_id, session_id, idx, raw_json)
+		VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert codeblock: %w", err)
+	}
+
+	batch.stmtInsertFileRef, err = tx.Prepare(`
+		INSERT OR IGNORE INTO files_referenced (session_id, file_path)
+		VALUES (?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert file ref: %w", err)
+	}
+
+	// Delete statements
+	batch.stmtDeleteMessages, err = tx.Prepare(`DELETE FROM messages WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete messages: %w", err)
+	}
+
+	batch.stmtDeleteMetadata, err = tx.Prepare(`DELETE FROM message_metadata WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete metadata: %w", err)
+	}
+
+	batch.stmtDeleteCaps, err = tx.Prepare(`DELETE FROM message_capabilities WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete caps: %w", err)
+	}
+
+	batch.stmtDeleteLints, err = tx.Prepare(`DELETE FROM message_lints WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete lints: %w", err)
+	}
+
+	batch.stmtDeleteMsgFiles, err = tx.Prepare(`DELETE FROM message_files WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete msg files: %w", err)
+	}
+
+	batch.stmtDeleteCodeblocks, err = tx.Prepare(`DELETE FROM message_codeblocks WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete codeblocks: %w", err)
+	}
+
+	batch.stmtDeleteFiles, err = tx.Prepare(`DELETE FROM files_referenced WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete files: %w", err)
+	}
+
+	return batch, nil
+}
+
+// UpsertSession upserts a session within the batch transaction
+func (b *TxBatch) UpsertSession(s *models.Session, rawJSON string) error {
+	_, err := b.stmtUpsertSession.Exec(s.ID, s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON)
+	return err
+}
+
+// DeleteSessionData deletes all data for a session within the batch transaction
+func (b *TxBatch) DeleteSessionData(sessionID string) error {
+	// Delete in order to respect FK constraints (metadata tables first)
+	if _, err := b.stmtDeleteMetadata.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteCaps.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteLints.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteMsgFiles.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteCodeblocks.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteMessages.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteFiles.Exec(sessionID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// InsertMessage inserts a message within the batch transaction
+func (b *TxBatch) InsertMessage(m *models.Message) error {
+	_, err := b.stmtInsertMessage.Exec(m.ID, m.SessionID, m.Role, m.Content, m.Sequence, m.Timestamp)
+	return err
+}
+
+// InsertMessagesBulk inserts multiple messages in a single SQL statement (much faster)
+func (b *TxBatch) InsertMessagesBulk(messages []models.Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	// SQLite has a limit of ~999 bound parameters, so batch in chunks
+	const batchSize = 100 // 6 params per row = 600 params per batch
+
+	for i := 0; i < len(messages); i += batchSize {
+		end := i + batchSize
+		if end > len(messages) {
+			end = len(messages)
+		}
+		batch := messages[i:end]
+
+		// Build multi-value INSERT
+		query := "INSERT OR REPLACE INTO messages (id, session_id, role, content, sequence, timestamp) VALUES "
+		args := make([]interface{}, 0, len(batch)*6)
+
+		for j, m := range batch {
+			if j > 0 {
+				query += ", "
+			}
+			query += "(?, ?, ?, ?, ?, ?)"
+			args = append(args, m.ID, m.SessionID, m.Role, m.Content, m.Sequence, m.Timestamp)
+		}
+
+		if _, err := b.tx.Exec(query, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// InsertMessageMetadata inserts message metadata within the batch transaction
+func (b *TxBatch) InsertMessageMetadata(messageID, sessionID, metadataJSON string) error {
+	_, err := b.stmtInsertMetadata.Exec(messageID, sessionID, metadataJSON)
+	return err
+}
+
+// MetadataEntry is a tuple for bulk metadata insert
+type MetadataEntry struct {
+	MessageID, SessionID, MetadataJSON string
+}
+
+// InsertMessageMetadataBulk inserts multiple metadata entries in a single SQL statement
+func (b *TxBatch) InsertMessageMetadataBulk(entries []MetadataEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	const batchSize = 200 // 3 params per row
+
+	for i := 0; i < len(entries); i += batchSize {
+		end := i + batchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		batch := entries[i:end]
+
+		query := `INSERT INTO message_metadata (message_id, session_id, metadata_json)
+		          VALUES `
+		args := make([]interface{}, 0, len(batch)*3)
+
+		for j, e := range batch {
+			if j > 0 {
+				query += ", "
+			}
+			query += "(?, ?, ?)"
+			args = append(args, e.MessageID, e.SessionID, e.MetadataJSON)
+		}
+		query += ` ON CONFLICT(message_id) DO UPDATE SET
+			session_id = excluded.session_id,
+			metadata_json = excluded.metadata_json`
+
+		if _, err := b.tx.Exec(query, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// InsertMessageCapability inserts a message capability within the batch transaction
+func (b *TxBatch) InsertMessageCapability(messageID, sessionID, phase string, capability int) error {
+	_, err := b.stmtInsertCapability.Exec(messageID, sessionID, phase, capability)
+	return err
+}
+
+// InsertMessageLint inserts a message lint within the batch transaction
+func (b *TxBatch) InsertMessageLint(messageID, sessionID, filePath, msg, source string, startLine, startCol, endLine, endCol int) error {
+	_, err := b.stmtInsertLint.Exec(messageID, sessionID, filePath, msg, source, startLine, startCol, endLine, endCol)
+	return err
+}
+
+// InsertMessageFile inserts a message file reference within the batch transaction
+func (b *TxBatch) InsertMessageFile(messageID, sessionID, kind, filePath string, lineNumber int) error {
+	_, err := b.stmtInsertMsgFile.Exec(messageID, sessionID, kind, filePath, lineNumber)
+	return err
+}
+
+// InsertMessageCodeblock inserts a message codeblock within the batch transaction
+func (b *TxBatch) InsertMessageCodeblock(messageID, sessionID string, idx int, rawJSON string) error {
+	_, err := b.stmtInsertCodeblock.Exec(messageID, sessionID, idx, rawJSON)
+	return err
+}
+
+// InsertFileReference inserts a file reference within the batch transaction
+func (b *TxBatch) InsertFileReference(sessionID, filePath string) error {
+	_, err := b.stmtInsertFileRef.Exec(sessionID, filePath)
+	return err
+}
+
+// FileRefEntry is a tuple for bulk file reference insert
+type FileRefEntry struct {
+	SessionID, FilePath string
+}
+
+// InsertFileReferencesBulk inserts multiple file references in a single SQL statement
+func (b *TxBatch) InsertFileReferencesBulk(entries []FileRefEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	const batchSize = 300 // 2 params per row
+
+	for i := 0; i < len(entries); i += batchSize {
+		end := i + batchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		batch := entries[i:end]
+
+		query := `INSERT OR IGNORE INTO files_referenced (session_id, file_path) VALUES `
+		args := make([]interface{}, 0, len(batch)*2)
+
+		for j, e := range batch {
+			if j > 0 {
+				query += ", "
+			}
+			query += "(?, ?)"
+			args = append(args, e.SessionID, e.FilePath)
+		}
+
+		if _, err := b.tx.Exec(query, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Commit commits the batch transaction
+func (b *TxBatch) Commit() error {
+	err := b.tx.Commit()
+	b.restoreOnce.Do(func() {
+		restoreBulkImportPragmas(b.conn, b.pragmaState)
+	})
+	return err
+}
+
+// Rollback rolls back the batch transaction
+func (b *TxBatch) Rollback() error {
+	err := b.tx.Rollback()
+	b.restoreOnce.Do(func() {
+		restoreBulkImportPragmas(b.conn, b.pragmaState)
+	})
+	return err
+}
+
+// Close closes all prepared statements (call after Commit or Rollback)
+func (b *TxBatch) Close() {
+	if b.stmtUpsertSession != nil {
+		b.stmtUpsertSession.Close()
+	}
+	if b.stmtInsertMessage != nil {
+		b.stmtInsertMessage.Close()
+	}
+	if b.stmtInsertMetadata != nil {
+		b.stmtInsertMetadata.Close()
+	}
+	if b.stmtInsertCapability != nil {
+		b.stmtInsertCapability.Close()
+	}
+	if b.stmtInsertLint != nil {
+		b.stmtInsertLint.Close()
+	}
+	if b.stmtInsertMsgFile != nil {
+		b.stmtInsertMsgFile.Close()
+	}
+	if b.stmtInsertCodeblock != nil {
+		b.stmtInsertCodeblock.Close()
+	}
+	if b.stmtInsertFileRef != nil {
+		b.stmtInsertFileRef.Close()
+	}
+	if b.stmtDeleteMessages != nil {
+		b.stmtDeleteMessages.Close()
+	}
+	if b.stmtDeleteMetadata != nil {
+		b.stmtDeleteMetadata.Close()
+	}
+	if b.stmtDeleteCaps != nil {
+		b.stmtDeleteCaps.Close()
+	}
+	if b.stmtDeleteLints != nil {
+		b.stmtDeleteLints.Close()
+	}
+	if b.stmtDeleteMsgFiles != nil {
+		b.stmtDeleteMsgFiles.Close()
+	}
+	if b.stmtDeleteCodeblocks != nil {
+		b.stmtDeleteCodeblocks.Close()
+	}
+	if b.stmtDeleteFiles != nil {
+		b.stmtDeleteFiles.Close()
+	}
 }
 
 // initSchema runs the embedded schema SQL

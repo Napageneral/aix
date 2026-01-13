@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/Napageneral/aix/internal/db"
 	"github.com/Napageneral/aix/internal/embeddings"
 	"github.com/Napageneral/aix/internal/gemini"
+	"github.com/Napageneral/aix/internal/models"
 	"github.com/Napageneral/aix/internal/sync"
 
 	teengine "github.com/Napageneral/taskengine/engine"
@@ -190,10 +192,25 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 				var sessions []*sync.ParsedSession
 				var errs []error
 
+				// Cursor rowid-based incremental sync state (fast-path)
+				var sinceRowID int64
+				if src == "cursor" {
+					if v, _ := database.GetSyncState("cursor:composer_max_rowid"); v != "" {
+						if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+							sinceRowID = n
+						}
+					}
+				}
+
 				switch src {
 				case "cursor":
 					dbPath := sync.DefaultCursorDBPath()
 					parser := sync.NewCursorDBParser(dbPath)
+
+					// Use rowid-based incremental parsing. When nothing changed, this avoids scanning all values.
+					if sinceRowID > 0 {
+						parser.WithSinceRowID(sinceRowID)
+					}
 
 					if !noExport {
 						expPath := exportPath
@@ -205,6 +222,11 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 					}
 
 					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+					// Persist updated rowid watermark (so next run can be truly incremental)
+					if maxRow := parser.ComposerMaxRowID(); maxRow > 0 {
+						_ = database.SetSyncState("cursor:composer_max_rowid", fmt.Sprintf("%d", maxRow))
+					}
 
 				case "codex":
 					parser := sync.NewCodexParser("")
@@ -269,98 +291,128 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 					continue
 				}
 
-				// Process sessions
-				for _, ps := range sessions {
-					isNew, err := database.UpsertSession(&ps.Session, ps.RawJSON)
+				// Delete data only for changed sessions (sessions list already filtered by parser)
+				if len(sessions) > 0 {
+					var sessionIDs []string
+					for _, ps := range sessions {
+						sessionIDs = append(sessionIDs, ps.Session.ID)
+					}
+					if err := database.DeleteSessionDataByIDs(sessionIDs); err != nil {
+						if !jsonOutput {
+							fmt.Fprintf(os.Stderr, "Error deleting session data: %v\n", err)
+						}
+					}
+				}
+
+				// Process sessions using batch transaction for performance
+				if len(sessions) > 0 {
+					batch, err := database.BeginBatch()
 					if err != nil {
-						errors++
+						errors += len(sessions)
 						if !jsonOutput {
-							fmt.Fprintf(os.Stderr, "Error saving session %s: %v\n", ps.Session.ID, err)
+							fmt.Fprintf(os.Stderr, "Error starting batch transaction: %v\n", err)
 						}
-						continue
-					}
+					} else {
+						// Collect all data first (respecting foreign key order: sessions -> messages -> metadata/caps/etc)
+						var allMessages []models.Message
+						var allMetadata []db.MetadataEntry
+						var allFileRefs []db.FileRefEntry
+						var allCaps []sync.MessageCapability
+						var allLints []sync.MessageLint
+						var allMsgFiles []sync.MessageFileRef
+						var allCodeblocks []sync.MessageCodeblock
 
-					// Clear old messages/files and insert new ones
-					if err := database.DeleteSessionMessages(ps.Session.ID); err != nil {
-						errors++
-						if !jsonOutput {
-							fmt.Fprintf(os.Stderr, "Error deleting messages for session %s: %v\n", ps.Session.ID, err)
-						}
-						continue
-					}
-					if err := database.DeleteSessionFiles(ps.Session.ID); err != nil {
-						errors++
-						if !jsonOutput {
-							fmt.Fprintf(os.Stderr, "Error deleting files for session %s: %v\n", ps.Session.ID, err)
-						}
-						continue
-					}
-
-					for _, msg := range ps.Messages {
-						if err := database.InsertMessage(&msg); err != nil {
-							errors++
-							if !jsonOutput {
-								fmt.Fprintf(os.Stderr, "Error inserting message %s: %v\n", msg.ID, err)
-							}
-						}
-						if meta, ok := ps.MessageMetadata[msg.ID]; ok && meta != "" {
-							if err := database.UpsertMessageMetadata(msg.ID, ps.Session.ID, meta); err != nil {
+						for _, ps := range sessions {
+							// Upsert session
+							if err := batch.UpsertSession(&ps.Session, ps.RawJSON); err != nil {
 								errors++
 								if !jsonOutput {
-									fmt.Fprintf(os.Stderr, "Error inserting message metadata %s: %v\n", msg.ID, err)
+									fmt.Fprintf(os.Stderr, "Error saving session %s: %v\n", ps.Session.ID, err)
+								}
+								continue
+							}
+
+							// Collect messages
+							for _, msg := range ps.Messages {
+								allMessages = append(allMessages, msg)
+								if meta, ok := ps.MessageMetadata[msg.ID]; ok && meta != "" {
+									allMetadata = append(allMetadata, db.MetadataEntry{
+										MessageID:    msg.ID,
+										SessionID:    ps.Session.ID,
+										MetadataJSON: meta,
+									})
 								}
 							}
-						}
-					}
 
-					// Insert flattened capabilities and lints (Cursor-specific)
-					for _, c := range ps.Capabilities {
-						if err := database.InsertMessageCapability(c.MessageID, c.SessionID, c.Phase, c.Capability); err != nil {
-							errors++
-							if !jsonOutput {
-								fmt.Fprintf(os.Stderr, "Error inserting message capability %s: %v\n", c.MessageID, err)
-							}
-						}
-					}
-					for _, l := range ps.Lints {
-						if err := database.InsertMessageLint(l.MessageID, l.SessionID, l.FilePath, l.Message, l.Source, l.StartLine, l.StartCol, l.EndLine, l.EndCol); err != nil {
-							errors++
-							if !jsonOutput {
-								fmt.Fprintf(os.Stderr, "Error inserting message lint %s: %v\n", l.MessageID, err)
-							}
-						}
-					}
-					for _, f := range ps.MessageFiles {
-						if err := database.InsertMessageFile(f.MessageID, f.SessionID, f.Kind, f.FilePath, f.LineNumber); err != nil {
-							errors++
-							if !jsonOutput {
-								fmt.Fprintf(os.Stderr, "Error inserting message file %s: %v\n", f.MessageID, err)
-							}
-						}
-					}
-					for _, cb := range ps.Codeblocks {
-						if err := database.InsertMessageCodeblock(cb.MessageID, cb.SessionID, cb.Idx, cb.RawJSON); err != nil {
-							errors++
-							if !jsonOutput {
-								fmt.Fprintf(os.Stderr, "Error inserting message codeblock %s: %v\n", cb.MessageID, err)
-							}
-						}
-					}
+							// Collect related data (will be inserted AFTER messages)
+							allCaps = append(allCaps, ps.Capabilities...)
+							allLints = append(allLints, ps.Lints...)
+							allMsgFiles = append(allMsgFiles, ps.MessageFiles...)
+							allCodeblocks = append(allCodeblocks, ps.Codeblocks...)
 
-					for _, file := range ps.Files {
-						if err := database.InsertFileReference(ps.Session.ID, file); err != nil {
-							errors++
-							if !jsonOutput {
-								fmt.Fprintf(os.Stderr, "Error inserting file reference for session %s: %v\n", ps.Session.ID, err)
+							// Collect file refs
+							for _, file := range ps.Files {
+								allFileRefs = append(allFileRefs, db.FileRefEntry{
+									SessionID: ps.Session.ID,
+									FilePath:  file,
+								})
+							}
+
+							synced++
+							updated++
+						}
+
+						// Insert messages FIRST (foreign key parent)
+						for _, msg := range allMessages {
+							if err := batch.InsertMessage(&msg); err != nil {
+								errors++
 							}
 						}
-					}
 
-					synced++
-					if isNew {
-						newCount++
-					} else {
-						updated++
+						// Insert metadata (references messages)
+						for _, meta := range allMetadata {
+							if err := batch.InsertMessageMetadata(meta.MessageID, meta.SessionID, meta.MetadataJSON); err != nil {
+								errors++
+							}
+						}
+
+						// Insert caps, lints, msgFiles, codeblocks (all reference messages)
+						for _, c := range allCaps {
+							if err := batch.InsertMessageCapability(c.MessageID, c.SessionID, c.Phase, c.Capability); err != nil {
+								errors++
+							}
+						}
+						for _, l := range allLints {
+							if err := batch.InsertMessageLint(l.MessageID, l.SessionID, l.FilePath, l.Message, l.Source, l.StartLine, l.StartCol, l.EndLine, l.EndCol); err != nil {
+								errors++
+							}
+						}
+						for _, f := range allMsgFiles {
+							if err := batch.InsertMessageFile(f.MessageID, f.SessionID, f.Kind, f.FilePath, f.LineNumber); err != nil {
+								errors++
+							}
+						}
+						for _, cb := range allCodeblocks {
+							if err := batch.InsertMessageCodeblock(cb.MessageID, cb.SessionID, cb.Idx, cb.RawJSON); err != nil {
+								errors++
+							}
+						}
+
+						// Insert file references
+						for _, ref := range allFileRefs {
+							if err := batch.InsertFileReference(ref.SessionID, ref.FilePath); err != nil {
+								errors++
+							}
+						}
+
+						if err := batch.Commit(); err != nil {
+							errors++
+							if !jsonOutput {
+								fmt.Fprintf(os.Stderr, "Error committing batch: %v\n", err)
+							}
+							batch.Rollback()
+						}
+						batch.Close()
 					}
 				}
 
@@ -375,8 +427,10 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 				}
 				if exportStats != nil {
 					result["exported"] = map[string]int{
-						"session_files": exportStats.ComposerFiles,
-						"message_files": exportStats.BubbleFiles,
+						"session_files":         exportStats.ComposerFiles,
+						"session_files_skipped": exportStats.ComposerFilesSkipped,
+						"message_files":         exportStats.BubbleFiles,
+						"message_files_skipped": exportStats.BubbleFilesSkipped,
 					}
 				}
 				sourceResults[src] = result
@@ -406,8 +460,15 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 					updated := res["updated"].(int)
 					errors := res["errors"].(int)
 					fmt.Printf("✓ %s: %d sessions (new: %d, updated: %d, errors: %d)\n", src, synced, newCount, updated, errors)
-					if exp, ok := res["exported"].(map[string]int); ok && (exp["session_files"] > 0 || exp["message_files"] > 0) {
-						fmt.Printf("  Exported: %d session files, %d message files\n", exp["session_files"], exp["message_files"])
+					if exp, ok := res["exported"].(map[string]int); ok {
+						sessNew := exp["session_files"]
+						sessSkip := exp["session_files_skipped"]
+						msgNew := exp["message_files"]
+						msgSkip := exp["message_files_skipped"]
+						if sessNew > 0 || msgNew > 0 || sessSkip > 0 || msgSkip > 0 {
+							fmt.Printf("  Exported: %d sessions (+%d unchanged), %d messages (+%d unchanged)\n",
+								sessNew, sessSkip, msgNew, msgSkip)
+						}
 					}
 				}
 				if len(sources) > 1 {
