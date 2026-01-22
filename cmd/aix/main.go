@@ -10,10 +10,14 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	stdsync "sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -51,6 +55,8 @@ func main() {
 
 	// sync
 	rootCmd.AddCommand(syncCmd())
+	// live
+	rootCmd.AddCommand(liveCmd())
 
 	// db
 	rootCmd.AddCommand(dbCmd())
@@ -152,6 +158,7 @@ func syncCmd() *cobra.Command {
 	var noExport bool
 	var exportPath string
 	var all bool
+	var cursorBubbleExport string
 
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -194,10 +201,16 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 
 				// Cursor rowid-based incremental sync state (fast-path)
 				var sinceRowID int64
+				var sinceBubbleRowID int64
 				if src == "cursor" {
 					if v, _ := database.GetSyncState("cursor:composer_max_rowid"); v != "" {
 						if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 							sinceRowID = n
+						}
+					}
+					if v, _ := database.GetSyncState("cursor:bubble_max_rowid"); v != "" {
+						if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+							sinceBubbleRowID = n
 						}
 					}
 				}
@@ -211,21 +224,186 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 					if sinceRowID > 0 {
 						parser.WithSinceRowID(sinceRowID)
 					}
+					// Also track bubble rowids for sessions with new messages
+					if sinceBubbleRowID > 0 {
+						parser.WithSinceBubbleRowID(sinceBubbleRowID)
+					}
 
+					bubbleMode := cursorBubbleExport
 					if !noExport {
 						expPath := exportPath
 						if expPath == "" {
 							expPath = sync.DefaultNexusSessionsPath()
 						}
 						parser.WithExport(expPath)
+						parser.WithBubbleExport(bubbleMode)
 						exportStats = &sync.ExportStats{}
 					}
 
-					sessions, errs = parser.ParseAllWithStats(exportStats)
+					// Pipeline: delete upfront, then import as sessions stream in.
+					// This overlaps export+parse with DB writes.
+					{
+						// Build session ID list to delete (cheap cursor DB query).
+						var sessionIDs []string
+						sessionIDSet := make(map[string]bool)
+						cdb, err := sql.Open("sqlite3", dbPath+"?mode=ro")
+						if err != nil {
+							errs = append(errs, fmt.Errorf("failed to open cursor db for id list: %w", err))
+						} else {
+							func() {
+								defer cdb.Close()
+								var rows *sql.Rows
+								if sinceRowID > 0 {
+									rows, err = cdb.Query(
+										`SELECT key FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL AND rowid > ?`,
+										sinceRowID,
+									)
+								} else {
+									rows, err = cdb.Query(
+										`SELECT key FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL`,
+									)
+								}
+								if err != nil {
+									errs = append(errs, fmt.Errorf("failed to query cursor session ids: %w", err))
+									return
+								}
+								defer rows.Close()
+								for rows.Next() {
+									var key string
+									if err := rows.Scan(&key); err != nil {
+										continue
+									}
+									sid := strings.TrimPrefix(key, "composerData:")
+									if !sessionIDSet[sid] {
+										sessionIDSet[sid] = true
+										sessionIDs = append(sessionIDs, sid)
+									}
+								}
 
-					// Persist updated rowid watermark (so next run can be truly incremental)
+								// Also include sessions with new bubbles
+								if sinceBubbleRowID > 0 {
+									bubbleRows, err := cdb.Query(
+										`SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS session_id
+										 FROM cursorDiskKV
+										 WHERE key LIKE 'bubbleId:%' AND rowid > ?`,
+										sinceBubbleRowID,
+									)
+									if err == nil {
+										for bubbleRows.Next() {
+											var sid string
+											if bubbleRows.Scan(&sid) == nil && sid != "" && !sessionIDSet[sid] {
+												sessionIDSet[sid] = true
+												sessionIDs = append(sessionIDs, sid)
+											}
+										}
+										bubbleRows.Close()
+									}
+								}
+							}()
+						}
+
+						// Delete existing data for changed sessions (avoid stale child rows).
+						if len(sessionIDs) > 0 {
+							if err := database.DeleteSessionDataByIDs(sessionIDs); err != nil && !jsonOutput {
+								fmt.Fprintf(os.Stderr, "Error deleting session data: %v\n", err)
+							}
+						}
+
+						// Start batch and import while parsing continues.
+						batch, err := database.BeginBatch()
+						if err != nil {
+							errs = append(errs, fmt.Errorf("error starting batch transaction: %w", err))
+							// Fallback to the non-streaming path below (parse -> delete -> bulk import).
+							fallbackSessions, errs2 := parser.ParseAllWithStats(exportStats)
+							sessions = fallbackSessions
+							if len(errs2) > 0 {
+								errs = append(errs, errs2...)
+							}
+							// Persist updated rowid watermarks (so next run can be truly incremental)
+							if maxRow := parser.ComposerMaxRowID(); maxRow > 0 {
+								_ = database.SetSyncState("cursor:composer_max_rowid", fmt.Sprintf("%d", maxRow))
+							}
+							if maxRow := parser.BubbleMaxRowID(); maxRow > 0 {
+								_ = database.SetSyncState("cursor:bubble_max_rowid", fmt.Sprintf("%d", maxRow))
+							}
+							break
+						}
+						defer batch.Close()
+
+						sessionCh, waitDone := parser.ParseAllStreaming(exportStats, bubbleMode)
+						for stream := range sessionCh {
+							if stream.Error != nil {
+								errs = append(errs, stream.Error)
+								continue
+							}
+							ps := stream.Session
+							if ps == nil {
+								continue
+							}
+
+							if err := batch.UpsertSession(&ps.Session, ps.RawJSON); err != nil {
+								errs = append(errs, fmt.Errorf("error saving session %s: %w", ps.Session.ID, err))
+								continue
+							}
+
+							// Messages first (FK parent), then child tables.
+							for _, msg := range ps.Messages {
+								m := msg
+								if err := batch.InsertMessage(&m); err != nil {
+									errs = append(errs, fmt.Errorf("error saving message %s: %w", msg.ID, err))
+								}
+								if meta, ok := ps.MessageMetadata[msg.ID]; ok && meta != "" {
+									if err := batch.InsertMessageMetadata(msg.ID, ps.Session.ID, meta); err != nil {
+										errs = append(errs, fmt.Errorf("error saving metadata %s: %w", msg.ID, err))
+									}
+								}
+							}
+							for _, c := range ps.Capabilities {
+								if err := batch.InsertMessageCapability(c.MessageID, c.SessionID, c.Phase, c.Capability); err != nil {
+									errs = append(errs, fmt.Errorf("error saving capability %s: %w", c.MessageID, err))
+								}
+							}
+							for _, l := range ps.Lints {
+								if err := batch.InsertMessageLint(l.MessageID, l.SessionID, l.FilePath, l.Message, l.Source, l.StartLine, l.StartCol, l.EndLine, l.EndCol); err != nil {
+									errs = append(errs, fmt.Errorf("error saving lint %s: %w", l.MessageID, err))
+								}
+							}
+							for _, f := range ps.MessageFiles {
+								if err := batch.InsertMessageFile(f.MessageID, f.SessionID, f.Kind, f.FilePath, f.LineNumber); err != nil {
+									errs = append(errs, fmt.Errorf("error saving message file %s: %w", f.MessageID, err))
+								}
+							}
+							for _, cb := range ps.Codeblocks {
+								if err := batch.InsertMessageCodeblock(cb.MessageID, cb.SessionID, cb.Idx, cb.RawJSON); err != nil {
+									errs = append(errs, fmt.Errorf("error saving codeblock %s: %w", cb.MessageID, err))
+								}
+							}
+							for _, file := range ps.Files {
+								if err := batch.InsertFileReference(ps.Session.ID, file); err != nil {
+									errs = append(errs, fmt.Errorf("error saving file ref %s: %w", ps.Session.ID, err))
+								}
+							}
+
+							synced++
+							updated++
+						}
+						waitDone()
+
+						if err := batch.Commit(); err != nil {
+							errs = append(errs, fmt.Errorf("error committing batch: %w", err))
+							_ = batch.Rollback()
+						}
+
+						// Prevent generic post-parse import path below from running for cursor.
+						sessions = nil
+					}
+
+					// Persist updated rowid watermarks (so next run can be truly incremental)
 					if maxRow := parser.ComposerMaxRowID(); maxRow > 0 {
 						_ = database.SetSyncState("cursor:composer_max_rowid", fmt.Sprintf("%d", maxRow))
+					}
+					if maxRow := parser.BubbleMaxRowID(); maxRow > 0 {
+						_ = database.SetSyncState("cursor:bubble_max_rowid", fmt.Sprintf("%d", maxRow))
 					}
 
 				case "codex":
@@ -493,8 +671,244 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 	cmd.Flags().BoolVar(&all, "all", false, "Sync from all available sources")
 	cmd.Flags().BoolVar(&noExport, "no-export", false, "Skip exporting raw sessions to nexus (not recommended)")
 	cmd.Flags().StringVar(&exportPath, "export-path", "", "Custom export path (default: ~/nexus/home/sessions)")
+	cmd.Flags().StringVar(&cursorBubbleExport, "cursor-bubble-export", "files", "Cursor bubble export mode when exporting: files (one file per bubble) or jsonl (one file per session, faster)")
 
 	return cmd
+}
+
+func liveCmd() *cobra.Command {
+	var source string
+	var noExport bool
+	var exportPath string
+	var cursorBubbleExport string
+	var debounceMS int
+	var pollMS int
+	var pidFile string
+
+	cmd := &cobra.Command{
+		Use:   "live",
+		Short: "Continuously sync sessions in real-time",
+		Long: `Watches the Cursor state database and incrementally syncs new sessions
+into aix.db as they appear. Designed for low-latency updates with minimal overhead.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if source == "" {
+				source = "cursor"
+			}
+			if source != "cursor" {
+				return fmt.Errorf("live sync currently supports only --source cursor")
+			}
+
+			if pidFile == "" {
+				pidFile = defaultLivePidFile(source)
+			}
+			if pidFile != "" {
+				if pid, running := checkExistingPID(pidFile); running {
+					fmt.Fprintf(os.Stderr, "aix live already running (pid %d)\n", pid)
+					os.Exit(10)
+				}
+				if err := writePIDFile(pidFile); err != nil {
+					return err
+				}
+				defer os.Remove(pidFile)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+			go func() {
+				<-sigChan
+				fmt.Fprintf(os.Stderr, "\nStopping live sync...\n")
+				cancel()
+			}()
+
+			cursorDBPath := sync.DefaultCursorDBPath()
+			if cursorDBPath == "" {
+				return fmt.Errorf("failed to determine Cursor DB path")
+			}
+			walPath := cursorDBPath + "-wal"
+
+			if _, err := os.Stat(cursorDBPath); err != nil {
+				return fmt.Errorf("cursor db not found at %s: %w", cursorDBPath, err)
+			}
+
+			if pollMS <= 0 {
+				pollMS = 250
+			}
+			if debounceMS <= 0 {
+				debounceMS = 200
+			}
+			pollDuration := time.Duration(pollMS) * time.Millisecond
+			debounceDuration := time.Duration(debounceMS) * time.Millisecond
+
+			fmt.Fprintf(os.Stderr, "Live sync started (source=%s, poll=%dms, debounce=%dms)\n", source, pollMS, debounceMS)
+			fmt.Fprintf(os.Stderr, "Watching: %s\n", cursorDBPath)
+
+			var lastDBMtime, lastWALMtime int64
+			if info, err := os.Stat(cursorDBPath); err == nil {
+				lastDBMtime = info.ModTime().UnixNano()
+			}
+			if info, err := os.Stat(walPath); err == nil {
+				lastWALMtime = info.ModTime().UnixNano()
+			}
+
+			var mu stdsync.Mutex
+			running := false
+			pending := false
+
+			var runSync func()
+			runSync = func() {
+				if ctx.Err() != nil {
+					return
+				}
+				mu.Lock()
+				if running {
+					pending = true
+					mu.Unlock()
+					return
+				}
+				running = true
+				mu.Unlock()
+
+				start := time.Now()
+				if err := runSyncCommand(ctx, source, noExport, exportPath, cursorBubbleExport); err != nil {
+					fmt.Fprintf(os.Stderr, "sync error: %v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "[%s] Sync complete (%s)\n", time.Now().Format("15:04:05"), time.Since(start).Round(time.Millisecond))
+				}
+
+				mu.Lock()
+				running = false
+				runAgain := pending
+				pending = false
+				mu.Unlock()
+
+				if runAgain {
+					go runSync()
+				}
+			}
+
+			fmt.Fprintf(os.Stderr, "[%s] Running initial sync...\n", time.Now().Format("15:04:05"))
+			runSync()
+
+			var lastSyncTime time.Time
+			ticker := time.NewTicker(pollDuration)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ticker.C:
+					var dbChanged, walChanged bool
+					if info, err := os.Stat(cursorDBPath); err == nil {
+						mtime := info.ModTime().UnixNano()
+						if mtime != lastDBMtime {
+							dbChanged = true
+							lastDBMtime = mtime
+						}
+					}
+					if info, err := os.Stat(walPath); err == nil {
+						mtime := info.ModTime().UnixNano()
+						if mtime != lastWALMtime {
+							walChanged = true
+							lastWALMtime = mtime
+						}
+					}
+					if !dbChanged && !walChanged {
+						continue
+					}
+					if time.Since(lastSyncTime) < debounceDuration {
+						continue
+					}
+					time.Sleep(debounceDuration / 2)
+					lastSyncTime = time.Now()
+					runSync()
+				}
+			}
+		},
+	}
+
+	cmd.Flags().StringVarP(&source, "source", "s", "cursor", "Data source (cursor)")
+	cmd.Flags().BoolVar(&noExport, "no-export", false, "Skip exporting raw sessions to nexus")
+	cmd.Flags().StringVar(&exportPath, "export-path", "", "Custom export path (default: ~/nexus/home/sessions)")
+	cmd.Flags().StringVar(&cursorBubbleExport, "cursor-bubble-export", "files", "Cursor bubble export mode: files or jsonl")
+	cmd.Flags().IntVar(&pollMS, "poll-ms", 250, "Poll interval in milliseconds")
+	cmd.Flags().IntVar(&debounceMS, "debounce-ms", 200, "Debounce interval in milliseconds")
+	cmd.Flags().StringVar(&pidFile, "pid-file", "", "PID file to prevent duplicate live sync instances")
+
+	return cmd
+}
+
+func defaultLivePidFile(source string) string {
+	dbPath := db.DefaultDBPath()
+	if dbPath == "" {
+		return ""
+	}
+	dir := filepath.Dir(dbPath)
+	return filepath.Join(dir, fmt.Sprintf("live-%s.pid", source))
+}
+
+func checkExistingPID(path string) (int, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	if processRunning(pid) {
+		return pid, true
+	}
+	_ = os.Remove(path)
+	return pid, false
+}
+
+func writePIDFile(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create pid dir: %w", err)
+	}
+	pid := strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(path, []byte(pid), 0644); err != nil {
+		return fmt.Errorf("failed to write pid file: %w", err)
+	}
+	return nil
+}
+
+func processRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return false
+	}
+	return true
+}
+
+func runSyncCommand(ctx context.Context, source string, noExport bool, exportPath string, cursorBubbleExport string) error {
+	args := []string{"sync", "--source", source}
+	if noExport {
+		args = append(args, "--no-export")
+	}
+	if exportPath != "" {
+		args = append(args, "--export-path", exportPath)
+	}
+	if cursorBubbleExport != "" {
+		args = append(args, "--cursor-bubble-export", cursorBubbleExport)
+	}
+	if jsonOutput {
+		args = append(args, "--json")
+	}
+	execCmd := exec.CommandContext(ctx, os.Args[0], args...)
+	execCmd.Stdout = os.Stdout
+	execCmd.Stderr = os.Stderr
+	return execCmd.Run()
 }
 
 func dbCmd() *cobra.Command {

@@ -53,10 +53,47 @@ var (
 	gitShaRe          = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
+// Fast substring checks to avoid running regexes on most content.
+// The export path can call RedactJSON hundreds of thousands of times; regex scans dominate runtime.
+var secretMarkers = []string{
+	"sk-ant-",
+	"sk-",
+	"pk-",
+	"ghp_",
+	"ghs_",
+	"gho_",
+	"npm_",
+	"ya29.",
+	"AQ.",
+	"AKIA",
+	"xoxb-",
+	"xoxp-",
+	"xoxa-",
+	"xoxr-",
+	"Bearer ",
+	"Basic ",
+	"BEGIN PRIVATE KEY",
+	"AIza", // common Google API key prefix (not currently a strict regex match, but a good marker)
+}
+
+func maybeContainsSecret(content string) bool {
+	for _, m := range secretMarkers {
+		if strings.Contains(content, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // RedactSecrets redacts known secret patterns from content
 // Note: High-entropy detection is disabled for performance (was too slow on large exports)
 func RedactSecrets(content string) string {
 	if content == "" {
+		return content
+	}
+
+	// Avoid regex scans when the string almost certainly contains no secrets.
+	if !maybeContainsSecret(content) {
 		return content
 	}
 
