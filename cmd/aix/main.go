@@ -171,6 +171,8 @@ Supported sources:
   claude-code - Claude Code CLI sessions (~/.claude/projects/)
   claude      - Claude Desktop app sessions (metadata only, messages in LevelDB)
   opencode    - OpenCode sessions (~/.local/share/opencode/storage/)
+  clawdbot    - Clawdbot sessions (~/.clawdbot/sessions/)
+  nexus       - Nexus sessions (~/nexus/state/sessions/)
   all         - Sync from all available sources
 
 Sessions are exported to ~/nexus/home/sessions/ for durability before importing.`,
@@ -180,7 +182,7 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 			// Determine which sources to sync
 			sources := []string{source}
 			if all || source == "all" {
-				sources = []string{"cursor", "codex", "claude-code", "claude", "opencode"}
+				sources = []string{"cursor", "codex", "claude-code", "claude", "opencode", "clawdbot", "nexus"}
 			}
 
 			// Open database
@@ -450,6 +452,38 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 
 				case "opencode":
 					parser := sync.NewOpenCodeParser("")
+
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
+					}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				case "clawdbot":
+					parser := sync.NewClawdbotParser("")
+					// Include .bak files for full compaction history
+					parser.WithBackups(true)
+
+					if !noExport {
+						expPath := exportPath
+						if expPath == "" {
+							expPath = sync.DefaultNexusSessionsPath()
+						}
+						parser.WithExport(expPath)
+						exportStats = &sync.ExportStats{}
+					}
+
+					sessions, errs = parser.ParseAllWithStats(exportStats)
+
+				case "nexus":
+					parser := sync.NewNexusParser("")
+					// Include .bak files for full compaction history
+					parser.WithBackups(true)
 
 					if !noExport {
 						expPath := exportPath
