@@ -98,6 +98,8 @@ type TxBatch struct {
 	stmtInsertLint       *sql.Stmt
 	stmtInsertMsgFile    *sql.Stmt
 	stmtInsertCodeblock  *sql.Stmt
+	stmtInsertToolCall   *sql.Stmt
+	stmtInsertTurn       *sql.Stmt
 	stmtInsertFileRef    *sql.Stmt
 	stmtDeleteMessages   *sql.Stmt
 	stmtDeleteMetadata   *sql.Stmt
@@ -105,6 +107,8 @@ type TxBatch struct {
 	stmtDeleteLints      *sql.Stmt
 	stmtDeleteMsgFiles   *sql.Stmt
 	stmtDeleteCodeblocks *sql.Stmt
+	stmtDeleteToolCalls  *sql.Stmt
+	stmtDeleteTurns      *sql.Stmt
 	stmtDeleteFiles      *sql.Stmt
 }
 
@@ -242,6 +246,8 @@ func (db *DB) DeleteSessionDataByIDs(sessionIDs []string) error {
 		"DELETE FROM message_lints WHERE session_id IN (" + inClause + ")",
 		"DELETE FROM message_files WHERE session_id IN (" + inClause + ")",
 		"DELETE FROM message_codeblocks WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM tool_calls WHERE session_id IN (" + inClause + ")",
+		"DELETE FROM turns WHERE session_id IN (" + inClause + ")",
 		"DELETE FROM messages WHERE session_id IN (" + inClause + ")",
 		"DELETE FROM files_referenced WHERE session_id IN (" + inClause + ")",
 	}
@@ -277,6 +283,14 @@ func (db *DB) DeleteAllSourceData(source string) error {
 	if err != nil {
 		return err
 	}
+	_, err = db.conn.Exec(`DELETE FROM tool_calls WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`DELETE FROM turns WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
+	if err != nil {
+		return err
+	}
 	_, err = db.conn.Exec(`DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE source = ?)`, source)
 	if err != nil {
 		return err
@@ -303,8 +317,10 @@ func (db *DB) BeginBatch() (*TxBatch, error) {
 
 	// Prepare all statements for reuse
 	batch.stmtUpsertSession, err = tx.Prepare(`
-		INSERT INTO sessions (id, source, project, model, created_at, message_count, summary, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, source, project, model, created_at, message_count, summary, raw_json,
+			parent_session_id, parent_message_id, tool_call_id, task_description, task_status, is_subagent,
+			context_token_limit, context_tokens_used, is_agentic, force_mode, workspace_path, context_json, conversation_state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			source = excluded.source,
 			project = excluded.project,
@@ -312,15 +328,29 @@ func (db *DB) BeginBatch() (*TxBatch, error) {
 			created_at = excluded.created_at,
 			message_count = excluded.message_count,
 			summary = excluded.summary,
-			raw_json = excluded.raw_json`)
+			raw_json = excluded.raw_json,
+			parent_session_id = excluded.parent_session_id,
+			parent_message_id = excluded.parent_message_id,
+			tool_call_id = excluded.tool_call_id,
+			task_description = excluded.task_description,
+			task_status = excluded.task_status,
+			is_subagent = excluded.is_subagent,
+			context_token_limit = excluded.context_token_limit,
+			context_tokens_used = excluded.context_tokens_used,
+			is_agentic = excluded.is_agentic,
+			force_mode = excluded.force_mode,
+			workspace_path = excluded.workspace_path,
+			context_json = excluded.context_json,
+			conversation_state = excluded.conversation_state`)
 	if err != nil {
 		tx.Rollback()
 		return nil, fmt.Errorf("prepare upsert session: %w", err)
 	}
 
 	batch.stmtInsertMessage, err = tx.Prepare(`
-		INSERT OR REPLACE INTO messages (id, session_id, role, content, sequence, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?)`)
+		INSERT OR REPLACE INTO messages (id, session_id, role, content, sequence, timestamp,
+			checkpoint_id, is_agentic, is_plan_execution, context_json, cursor_rules_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return nil, fmt.Errorf("prepare insert message: %w", err)
@@ -364,6 +394,22 @@ func (db *DB) BeginBatch() (*TxBatch, error) {
 	if err != nil {
 		tx.Rollback()
 		return nil, fmt.Errorf("prepare insert codeblock: %w", err)
+	}
+
+	batch.stmtInsertToolCall, err = tx.Prepare(`
+		INSERT OR REPLACE INTO tool_calls (id, message_id, session_id, tool_name, tool_number, params_json, result_json, status, child_session_id, started_at, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert tool call: %w", err)
+	}
+
+	batch.stmtInsertTurn, err = tx.Prepare(`
+		INSERT OR REPLACE INTO turns (id, session_id, parent_turn_id, query_message_ids, response_message_id, model, token_count, timestamp, has_children, tool_call_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare insert turn: %w", err)
 	}
 
 	batch.stmtInsertFileRef, err = tx.Prepare(`
@@ -411,6 +457,18 @@ func (db *DB) BeginBatch() (*TxBatch, error) {
 		return nil, fmt.Errorf("prepare delete codeblocks: %w", err)
 	}
 
+	batch.stmtDeleteToolCalls, err = tx.Prepare(`DELETE FROM tool_calls WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete tool calls: %w", err)
+	}
+
+	batch.stmtDeleteTurns, err = tx.Prepare(`DELETE FROM turns WHERE session_id = ?`)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("prepare delete turns: %w", err)
+	}
+
 	batch.stmtDeleteFiles, err = tx.Prepare(`DELETE FROM files_referenced WHERE session_id = ?`)
 	if err != nil {
 		tx.Rollback()
@@ -422,8 +480,45 @@ func (db *DB) BeginBatch() (*TxBatch, error) {
 
 // UpsertSession upserts a session within the batch transaction
 func (b *TxBatch) UpsertSession(s *models.Session, rawJSON string) error {
-	_, err := b.stmtUpsertSession.Exec(s.ID, s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON)
+	isSubagent := 0
+	if s.IsSubagent {
+		isSubagent = 1
+	}
+	isAgentic := 0
+	if s.IsAgentic {
+		isAgentic = 1
+	}
+	_, err := b.stmtUpsertSession.Exec(
+		s.ID, s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON,
+		nullString(s.ParentSessionID), nullString(s.ParentMessageID), nullString(s.ToolCallID),
+		nullString(s.TaskDescription), nullString(s.TaskStatus), isSubagent,
+		nullInt(s.ContextTokenLimit), nullInt(s.ContextTokensUsed), isAgentic,
+		nullString(s.ForceMode), nullString(s.WorkspacePath), nullString(s.ContextJSON), nullString(s.ConversationState),
+	)
 	return err
+}
+
+// nullInt returns sql.NullInt64 for optional int fields
+func nullInt(i int) sql.NullInt64 {
+	if i == 0 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(i), Valid: true}
+}
+
+func nullInt64(i int64) sql.NullInt64 {
+	if i == 0 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: i, Valid: true}
+}
+
+// nullString returns sql.NullString for optional string fields
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 // DeleteSessionData deletes all data for a session within the batch transaction
@@ -444,6 +539,12 @@ func (b *TxBatch) DeleteSessionData(sessionID string) error {
 	if _, err := b.stmtDeleteCodeblocks.Exec(sessionID); err != nil {
 		return err
 	}
+	if _, err := b.stmtDeleteToolCalls.Exec(sessionID); err != nil {
+		return err
+	}
+	if _, err := b.stmtDeleteTurns.Exec(sessionID); err != nil {
+		return err
+	}
 	if _, err := b.stmtDeleteMessages.Exec(sessionID); err != nil {
 		return err
 	}
@@ -455,7 +556,18 @@ func (b *TxBatch) DeleteSessionData(sessionID string) error {
 
 // InsertMessage inserts a message within the batch transaction
 func (b *TxBatch) InsertMessage(m *models.Message) error {
-	_, err := b.stmtInsertMessage.Exec(m.ID, m.SessionID, m.Role, m.Content, m.Sequence, m.Timestamp)
+	isAgentic := 0
+	if m.IsAgentic {
+		isAgentic = 1
+	}
+	isPlanExec := 0
+	if m.IsPlanExecution {
+		isPlanExec = 1
+	}
+	_, err := b.stmtInsertMessage.Exec(
+		m.ID, m.SessionID, m.Role, m.Content, m.Sequence, m.Timestamp,
+		nullString(m.CheckpointID), isAgentic, isPlanExec, nullString(m.ContextJSON), nullString(m.CursorRulesJSON),
+	)
 	return err
 }
 
@@ -466,7 +578,7 @@ func (b *TxBatch) InsertMessagesBulk(messages []models.Message) error {
 	}
 
 	// SQLite has a limit of ~999 bound parameters, so batch in chunks
-	const batchSize = 100 // 6 params per row = 600 params per batch
+	const batchSize = 80 // 11 params per row = 880 params per batch
 
 	for i := 0; i < len(messages); i += batchSize {
 		end := i + batchSize
@@ -476,15 +588,25 @@ func (b *TxBatch) InsertMessagesBulk(messages []models.Message) error {
 		batch := messages[i:end]
 
 		// Build multi-value INSERT
-		query := "INSERT OR REPLACE INTO messages (id, session_id, role, content, sequence, timestamp) VALUES "
-		args := make([]interface{}, 0, len(batch)*6)
+		query := "INSERT OR REPLACE INTO messages (id, session_id, role, content, sequence, timestamp, checkpoint_id, is_agentic, is_plan_execution, context_json, cursor_rules_json) VALUES "
+		args := make([]interface{}, 0, len(batch)*11)
 
 		for j, m := range batch {
 			if j > 0 {
 				query += ", "
 			}
-			query += "(?, ?, ?, ?, ?, ?)"
-			args = append(args, m.ID, m.SessionID, m.Role, m.Content, m.Sequence, m.Timestamp)
+			query += "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+			isAgentic := 0
+			if m.IsAgentic {
+				isAgentic = 1
+			}
+			isPlanExec := 0
+			if m.IsPlanExecution {
+				isPlanExec = 1
+			}
+			args = append(args, m.ID, m.SessionID, m.Role, m.Content, m.Sequence, m.Timestamp,
+				nullString(m.CheckpointID).String, isAgentic, isPlanExec,
+				nullString(m.ContextJSON).String, nullString(m.CursorRulesJSON).String)
 		}
 
 		if _, err := b.tx.Exec(query, args...); err != nil {
@@ -563,6 +685,57 @@ func (b *TxBatch) InsertMessageFile(messageID, sessionID, kind, filePath string,
 // InsertMessageCodeblock inserts a message codeblock within the batch transaction
 func (b *TxBatch) InsertMessageCodeblock(messageID, sessionID string, idx int, rawJSON string) error {
 	_, err := b.stmtInsertCodeblock.Exec(messageID, sessionID, idx, rawJSON)
+	return err
+}
+
+// InsertToolCall inserts a tool call record within the batch transaction.
+func (b *TxBatch) InsertToolCall(tc *models.ToolCall) error {
+	if tc == nil || tc.ID == "" {
+		return nil
+	}
+	_, err := b.stmtInsertToolCall.Exec(
+		tc.ID,
+		nullString(tc.MessageID),
+		tc.SessionID,
+		nullString(tc.ToolName),
+		nullInt(tc.ToolNumber),
+		nullString(tc.ParamsJSON),
+		nullString(tc.ResultJSON),
+		nullString(tc.Status),
+		nullString(tc.ChildSessionID),
+		nullInt64(tc.StartedAt),
+		nullInt64(tc.CompletedAt),
+	)
+	return err
+}
+
+// InsertTurn inserts a turn record within the batch transaction.
+func (b *TxBatch) InsertTurn(t *models.Turn) error {
+	if t == nil || t.ID == "" {
+		return nil
+	}
+	queryIDsJSON := ""
+	if len(t.QueryMessageIDs) > 0 {
+		if bts, err := json.Marshal(t.QueryMessageIDs); err == nil {
+			queryIDsJSON = string(bts)
+		}
+	}
+	hasChildren := 0
+	if t.HasChildren {
+		hasChildren = 1
+	}
+	_, err := b.stmtInsertTurn.Exec(
+		t.ID,
+		t.SessionID,
+		nullString(t.ParentTurnID),
+		nullString(queryIDsJSON),
+		nullString(t.ResponseMessageID),
+		nullString(t.Model),
+		t.TokenCount,
+		t.Timestamp,
+		hasChildren,
+		t.ToolCallCount,
+	)
 	return err
 }
 
@@ -651,6 +824,12 @@ func (b *TxBatch) Close() {
 	if b.stmtInsertCodeblock != nil {
 		b.stmtInsertCodeblock.Close()
 	}
+	if b.stmtInsertToolCall != nil {
+		b.stmtInsertToolCall.Close()
+	}
+	if b.stmtInsertTurn != nil {
+		b.stmtInsertTurn.Close()
+	}
 	if b.stmtInsertFileRef != nil {
 		b.stmtInsertFileRef.Close()
 	}
@@ -671,6 +850,12 @@ func (b *TxBatch) Close() {
 	}
 	if b.stmtDeleteCodeblocks != nil {
 		b.stmtDeleteCodeblocks.Close()
+	}
+	if b.stmtDeleteToolCalls != nil {
+		b.stmtDeleteToolCalls.Close()
+	}
+	if b.stmtDeleteTurns != nil {
+		b.stmtDeleteTurns.Close()
 	}
 	if b.stmtDeleteFiles != nil {
 		b.stmtDeleteFiles.Close()
@@ -728,6 +913,71 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("failed to add model column: %w", err)
 		}
 	}
+
+	// Add subagent/task tracking columns if missing
+	sessionColumns := []struct {
+		name string
+		def  string
+	}{
+		// Subagent columns
+		{"parent_session_id", "TEXT"},
+		{"parent_message_id", "TEXT"},
+		{"tool_call_id", "TEXT"},
+		{"task_description", "TEXT"},
+		{"task_status", "TEXT"},
+		{"is_subagent", "INTEGER DEFAULT 0"},
+		// New metadata columns
+		{"context_token_limit", "INTEGER"},
+		{"context_tokens_used", "INTEGER"},
+		{"is_agentic", "INTEGER DEFAULT 0"},
+		{"force_mode", "TEXT"},
+		{"workspace_path", "TEXT"},
+		{"context_json", "TEXT"},
+		{"conversation_state", "TEXT"},
+	}
+	for _, col := range sessionColumns {
+		var hasCol int
+		err = db.conn.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?
+		`, col.name).Scan(&hasCol)
+		if err != nil {
+			return err
+		}
+		if hasCol == 0 {
+			_, err = db.conn.Exec(fmt.Sprintf(`ALTER TABLE sessions ADD COLUMN %s %s`, col.name, col.def))
+			if err != nil {
+				return fmt.Errorf("failed to add %s column: %w", col.name, err)
+			}
+		}
+	}
+
+	// Migrate messages table
+	messageColumns := []struct {
+		name string
+		def  string
+	}{
+		{"checkpoint_id", "TEXT"},
+		{"is_agentic", "INTEGER DEFAULT 0"},
+		{"is_plan_execution", "INTEGER DEFAULT 0"},
+		{"context_json", "TEXT"},
+		{"cursor_rules_json", "TEXT"},
+	}
+	for _, col := range messageColumns {
+		var hasCol int
+		err = db.conn.QueryRow(`
+			SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?
+		`, col.name).Scan(&hasCol)
+		if err != nil {
+			return err
+		}
+		if hasCol == 0 {
+			_, err = db.conn.Exec(fmt.Sprintf(`ALTER TABLE messages ADD COLUMN %s %s`, col.name, col.def))
+			if err != nil {
+				return fmt.Errorf("failed to add messages.%s column: %w", col.name, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -738,17 +988,28 @@ func (db *DB) UpsertSession(s *models.Session, rawJSON string) (isNew bool, err 
 	err = db.conn.QueryRow("SELECT id FROM sessions WHERE id = ?", s.ID).Scan(&existing)
 	isNew = err == sql.ErrNoRows
 
+	isSubagent := 0
+	if s.IsSubagent {
+		isSubagent = 1
+	}
+
 	if isNew {
 		_, err = db.conn.Exec(`
-			INSERT INTO sessions (id, source, project, model, created_at, message_count, summary, raw_json)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			s.ID, s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON)
+			INSERT INTO sessions (id, source, project, model, created_at, message_count, summary, raw_json,
+				parent_session_id, parent_message_id, tool_call_id, task_description, task_status, is_subagent)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			s.ID, s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON,
+			nullString(s.ParentSessionID), nullString(s.ParentMessageID), nullString(s.ToolCallID),
+			nullString(s.TaskDescription), nullString(s.TaskStatus), isSubagent)
 	} else {
 		_, err = db.conn.Exec(`
 			UPDATE sessions 
-			SET source = ?, project = ?, model = ?, created_at = ?, message_count = ?, summary = ?, raw_json = ?
+			SET source = ?, project = ?, model = ?, created_at = ?, message_count = ?, summary = ?, raw_json = ?,
+				parent_session_id = ?, parent_message_id = ?, tool_call_id = ?, task_description = ?, task_status = ?, is_subagent = ?
 			WHERE id = ?`,
-			s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON, s.ID)
+			s.Source, s.Project, s.Model, s.CreatedAt, s.MessageCount, s.Summary, rawJSON,
+			nullString(s.ParentSessionID), nullString(s.ParentMessageID), nullString(s.ToolCallID),
+			nullString(s.TaskDescription), nullString(s.TaskStatus), isSubagent, s.ID)
 	}
 
 	return isNew, err
@@ -836,6 +1097,12 @@ func (db *DB) DeleteSessionMessages(sessionID string) error {
 		return err
 	}
 	if _, err := db.conn.Exec("DELETE FROM message_codeblocks WHERE session_id = ?", sessionID); err != nil {
+		return err
+	}
+	if _, err := db.conn.Exec("DELETE FROM tool_calls WHERE session_id = ?", sessionID); err != nil {
+		return err
+	}
+	if _, err := db.conn.Exec("DELETE FROM turns WHERE session_id = ?", sessionID); err != nil {
 		return err
 	}
 	_, err := db.conn.Exec("DELETE FROM messages WHERE session_id = ?", sessionID)

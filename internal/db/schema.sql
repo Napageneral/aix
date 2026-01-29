@@ -3,15 +3,36 @@
 
 -- Sessions table - one row per conversation
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,              -- composerId UUID
+    id TEXT PRIMARY KEY,              -- composerId UUID or task-<toolCallId> for subagents
     source TEXT NOT NULL DEFAULT 'cursor',
     project TEXT,                     -- inferred from file paths
     model TEXT,                       -- AI model used (e.g. 'claude-4.5-opus-high-thinking')
     created_at INTEGER,               -- unix timestamp in milliseconds
     message_count INTEGER DEFAULT 0,
     summary TEXT,                     -- generated later
-    raw_json TEXT                     -- original JSON for re-parsing
+    raw_json TEXT,                    -- original JSON for re-parsing
+    
+    -- Subagent/task tracking (Cursor task_v2 support)
+    parent_session_id TEXT,           -- parent session that spawned this task
+    parent_message_id TEXT,           -- bubble in parent where task was dispatched
+    tool_call_id TEXT,                -- toolCallId linking parent → child (e.g. toolu_bdrk_...)
+    task_description TEXT,            -- description param from task dispatch
+    task_status TEXT,                 -- pending, running, completed, failed
+    is_subagent INTEGER DEFAULT 0,    -- 1 if this is a subagent/task session
+    
+    -- Session-level metadata (Cursor-specific)
+    context_token_limit INTEGER,      -- e.g. 176000
+    context_tokens_used INTEGER,      -- tokens used in context window
+    is_agentic INTEGER DEFAULT 0,     -- 1 if agentic mode
+    force_mode TEXT,                  -- 'edit', 'chat', etc.
+    workspace_path TEXT,              -- workspace root path
+    context_json TEXT,                -- session-level context (fileSelections, folderSelections, etc.)
+    conversation_state TEXT           -- serialized conversation state (can be large)
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_tool_call ON sessions(tool_call_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_is_subagent ON sessions(is_subagent);
 
 -- Messages table - individual conversation turns
 CREATE TABLE IF NOT EXISTS messages (
@@ -21,7 +42,44 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT,
     sequence INTEGER,                 -- order in conversation
     timestamp INTEGER,
+    
+    -- Message-level metadata (Cursor-specific)
+    checkpoint_id TEXT,               -- for forking/checkpoints
+    is_agentic INTEGER DEFAULT 0,     -- 1 if agentic mode for this message
+    is_plan_execution INTEGER DEFAULT 0, -- 1 if plan execution mode
+    context_json TEXT,                -- per-message context (fileSelections, folderSelections, mentions)
+    cursor_rules_json TEXT,           -- cursor rules in effect for this message
+    
     UNIQUE(session_id, sequence)
+);
+
+-- Tool calls captured from messages (Cursor toolFormerData, etc.)
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id TEXT PRIMARY KEY,              -- toolCallId
+    message_id TEXT REFERENCES messages(id),
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    tool_name TEXT,                   -- 'task_v2', 'Shell', etc.
+    tool_number INTEGER,              -- numeric tool id
+    params_json TEXT,                 -- raw params
+    result_json TEXT,                 -- raw result
+    status TEXT,                      -- pending, running, completed, failed
+    child_session_id TEXT,            -- task-<toolCallId> if spawned
+    started_at INTEGER,
+    completed_at INTEGER
+);
+
+-- Turn table (query + response exchange)
+CREATE TABLE IF NOT EXISTS turns (
+    id TEXT PRIMARY KEY,              -- final assistant message id
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    parent_turn_id TEXT REFERENCES turns(id),
+    query_message_ids TEXT,           -- JSON array of input message ids
+    response_message_id TEXT REFERENCES messages(id),
+    model TEXT,
+    token_count INTEGER,
+    timestamp INTEGER,
+    has_children INTEGER DEFAULT 0,
+    tool_call_count INTEGER DEFAULT 0
 );
 
 -- Files referenced in sessions
@@ -115,6 +173,11 @@ CREATE INDEX IF NOT EXISTS idx_message_lints_session ON message_lints(session_id
 CREATE INDEX IF NOT EXISTS idx_message_files_session ON message_files(session_id);
 CREATE INDEX IF NOT EXISTS idx_message_files_path ON message_files(file_path);
 CREATE INDEX IF NOT EXISTS idx_message_codeblocks_session ON message_codeblocks(session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_child ON tool_calls(child_session_id);
+CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
+CREATE INDEX IF NOT EXISTS idx_turns_parent ON turns(parent_turn_id);
 
 CREATE INDEX IF NOT EXISTS idx_embeddings_entity ON embeddings(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);

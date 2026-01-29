@@ -36,6 +36,26 @@ type CursorDBParser struct {
 	maxComposerID    int64             // observed max rowid for composerData (for sync_state)
 	maxBubbleRowID   int64             // observed max rowid for bubbleId (for sync_state)
 	bubbleExport     string            // "files" (default) or "jsonl" (packed per session)
+
+	// Task dispatch tracking (populated during parsing)
+	// Maps tool_call_id -> TaskDispatch for linking parent/child sessions
+	taskDispatches   map[string]*TaskDispatch
+	taskDispatchesMu sync.Mutex // Protects taskDispatches
+}
+
+// TaskDispatch represents a task_v2 tool call that spawned a subagent
+type TaskDispatch struct {
+	ToolCallID           string // The toolCallId (e.g. toolu_bdrk_01M8WJ...)
+	ParentSessionID      string // The session that dispatched the task
+	ParentMessageID      string // The bubble where the task was dispatched
+	Description          string // Task description param
+	Model                string // Model used for the task
+	Status               string // pending, running, completed, failed
+	Prompt               string // Full prompt sent to the subagent
+	ParamsJSON           string // Raw params payload
+	ResultJSON           string // Raw result payload
+	DispatchCreatedAt    int64  // Timestamp of the dispatch bubble
+	EmbeddedComposerData string // If present, the full composerData JSON embedded inline
 }
 
 // NewCursorDBParser creates a parser that reads directly from Cursor's DB
@@ -43,7 +63,10 @@ func NewCursorDBParser(dbPath string) *CursorDBParser {
 	if dbPath == "" {
 		dbPath = DefaultCursorDBPath()
 	}
-	return &CursorDBParser{dbPath: dbPath}
+	return &CursorDBParser{
+		dbPath:         dbPath,
+		taskDispatches: make(map[string]*TaskDispatch),
+	}
 }
 
 // WithExport configures the parser to export sessions to the given path
@@ -239,9 +262,10 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 	// FAST PATH: rowid-based incremental sync (skip scanning all composerData values)
 	// This avoids the expensive "read every value + hash" loop when nothing changed.
 	if p.sinceRowID > 0 {
+		// Exclude task sessions - they're handled separately in parseTaskSessions
 		rows, err := db.Query(
 			`SELECT rowid, key, value FROM cursorDiskKV
-			 WHERE key LIKE 'composerData:%' AND value IS NOT NULL AND rowid > ?`,
+			 WHERE key LIKE 'composerData:%' AND key NOT LIKE 'composerData:task-%' AND value IS NOT NULL AND rowid > ?`,
 			p.sinceRowID,
 		)
 		if err != nil {
@@ -400,6 +424,11 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 			exportStats.BubbleFilesSkipped = bubbleSkipped
 		}
 
+		// Also parse task sessions in fast path
+		taskSessions, taskErrors := p.parseTaskSessions(db, bubblesDir, p.bubbleExportMode())
+		sessions = append(sessions, taskSessions...)
+		errors = append(errors, taskErrors...)
+
 		return sessions, errors
 	}
 
@@ -411,7 +440,8 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 	var entriesToProcess []sessionEntry
 	var changedSessionIDs = make(map[string]bool)
 
-	rows1, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL`)
+	// Exclude task sessions (composerData:task-*) from regular processing - they're handled separately
+	rows1, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND key NOT LIKE 'composerData:task-%' AND value IS NOT NULL`)
 	if err != nil {
 		return nil, []error{fmt.Errorf("failed to query sessions: %w", err)}
 	}
@@ -589,7 +619,453 @@ func (p *CursorDBParser) ParseAllWithStats(exportStats *ExportStats) ([]*ParsedS
 		exportStats.BubbleFilesSkipped = bubbleSkipped
 	}
 
+	// SECOND PASS: Parse task sessions (subagents) and link to parents
+	taskSessions, taskErrors := p.parseTaskSessions(db, bubblesDir, p.bubbleExportMode())
+	sessions = append(sessions, taskSessions...)
+	errors = append(errors, taskErrors...)
+
 	return sessions, errors
+}
+
+// parseTaskSessions parses subagent sessions from embedded composerData,
+// composerData:task-* keys, and bubbleId:task-* keys.
+func (p *CursorDBParser) parseTaskSessions(db *sql.DB, bubblesDir string, bubbleExportMode string) ([]*ParsedSession, []error) {
+	if bubbleExportMode == "" {
+		bubbleExportMode = p.bubbleExportMode()
+	}
+
+	var errors []error
+	subagentSessions := make(map[string]*ParsedSession)
+
+	// Copy dispatches for thread-safety
+	dispatches := make(map[string]*TaskDispatch)
+	p.taskDispatchesMu.Lock()
+	for k, v := range p.taskDispatches {
+		dispatches[k] = v
+	}
+	p.taskDispatchesMu.Unlock()
+
+	// Load all task bubbles once: bubbleId:task-<toolCallId>:<bubbleId>
+	taskBubbles := make(map[string]map[string]string)
+	if rows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:task-%' AND value IS NOT NULL`); err == nil {
+		for rows.Next() {
+			var key, value string
+			if err := rows.Scan(&key, &value); err != nil {
+				continue
+			}
+			parts := strings.SplitN(key, ":", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			taskID := parts[1] // task-<toolCallId>
+			toolCallID := strings.TrimPrefix(taskID, "task-")
+			if toolCallID == "" {
+				continue
+			}
+			group := taskBubbles[toolCallID]
+			if group == nil {
+				group = make(map[string]string)
+				taskBubbles[toolCallID] = group
+			}
+			group[key] = value
+		}
+		rows.Close()
+	} else {
+		errors = append(errors, fmt.Errorf("failed to query task bubbles: %w", err))
+	}
+
+	mergeSession := func(ps *ParsedSession, toolCallID string, dispatch *TaskDispatch, bubbles map[string]string) {
+		if ps == nil || toolCallID == "" {
+			return
+		}
+		applyDispatchToParsedSession(ps, toolCallID, dispatch)
+		sessionID := ps.Session.ID
+		existing := subagentSessions[sessionID]
+		if existing == nil {
+			subagentSessions[sessionID] = ps
+		} else {
+			subagentSessions[sessionID] = chooseParsedSession(existing, ps)
+		}
+		if bubblesDir != "" && len(bubbles) > 0 {
+			_ = exportBubblesForSession(bubblesDir, bubbleExportMode, sessionID, bubbles)
+		}
+	}
+
+	// 1) composerData:task-* sessions (rare)
+	if rows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:task-%' AND value IS NOT NULL`); err == nil {
+		for rows.Next() {
+			var key, value string
+			if err := rows.Scan(&key, &value); err != nil {
+				errors = append(errors, err)
+				continue
+			}
+			taskID := strings.TrimPrefix(key, "composerData:")
+			toolCallID := strings.TrimPrefix(taskID, "task-")
+			bubbleCache := taskBubbles[toolCallID]
+			session, bubbles, err := p.parseSessionWithBubblesFromCache(bubbleCache, key, value)
+			if err != nil {
+				errors = append(errors, fmt.Errorf("%s: %w", key, err))
+				continue
+			}
+			mergeSession(session, toolCallID, dispatches[toolCallID], bubbles)
+		}
+		rows.Close()
+	} else {
+		errors = append(errors, fmt.Errorf("failed to query task sessions: %w", err))
+	}
+
+	// 2) embedded composerData from task dispatches
+	for toolCallID, dispatch := range dispatches {
+		if dispatch == nil || dispatch.EmbeddedComposerData == "" {
+			continue
+		}
+		composerID := gjson.Get(dispatch.EmbeddedComposerData, "composerId").String()
+		if composerID == "" {
+			continue
+		}
+		bubbleCache := make(map[string]string)
+		if group := taskBubbles[toolCallID]; group != nil {
+			for k, v := range group {
+				bubbleCache[k] = v
+			}
+			// If composerId differs, alias keys to match expected prefix
+			if composerID != "task-"+toolCallID {
+				for k, v := range group {
+					parts := strings.SplitN(k, ":", 3)
+					if len(parts) < 3 {
+						continue
+					}
+					aliasKey := fmt.Sprintf("bubbleId:%s:%s", composerID, parts[2])
+					bubbleCache[aliasKey] = v
+				}
+			}
+		}
+		session, bubbles, err := p.parseSessionWithBubblesFromCache(bubbleCache, "composerData:"+composerID, dispatch.EmbeddedComposerData)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("embedded composerData (%s): %w", toolCallID, err))
+			continue
+		}
+		mergeSession(session, toolCallID, dispatch, bubbles)
+	}
+
+	// 3) bubbleId:task-* sessions (when no composerData exists)
+	for toolCallID, bubbleCache := range taskBubbles {
+		if toolCallID == "" {
+			continue
+		}
+		session, bubbles := parseTaskSessionFromBubbles(toolCallID, bubbleCache)
+		mergeSession(session, toolCallID, dispatches[toolCallID], bubbles)
+	}
+
+	// 4) minimal subagent sessions for UUID-format dispatches
+	for toolCallID, dispatch := range dispatches {
+		if toolCallID == "" {
+			continue
+		}
+		sessionID := "task-" + toolCallID
+		if _, ok := subagentSessions[sessionID]; ok {
+			continue
+		}
+		session := buildMinimalSubagentSession(toolCallID, dispatch)
+		mergeSession(session, toolCallID, dispatch, nil)
+	}
+
+	// Flatten map to slice
+	sessions := make([]*ParsedSession, 0, len(subagentSessions))
+	for _, ps := range subagentSessions {
+		sessions = append(sessions, ps)
+	}
+	return sessions, errors
+}
+
+func applyDispatchToParsedSession(ps *ParsedSession, toolCallID string, dispatch *TaskDispatch) {
+	if ps == nil {
+		return
+	}
+	if toolCallID != "" {
+		targetID := "task-" + toolCallID
+		if ps.Session.ID != targetID {
+			rewriteParsedSessionID(ps, targetID)
+		}
+		ps.Session.ToolCallID = toolCallID
+	}
+	ps.Session.IsSubagent = true
+	if dispatch == nil {
+		return
+	}
+	if ps.Session.ParentSessionID == "" {
+		ps.Session.ParentSessionID = dispatch.ParentSessionID
+	}
+	if ps.Session.ParentMessageID == "" {
+		ps.Session.ParentMessageID = dispatch.ParentMessageID
+	}
+	if ps.Session.TaskDescription == "" {
+		ps.Session.TaskDescription = dispatch.Description
+	}
+	if ps.Session.TaskStatus == "" {
+		ps.Session.TaskStatus = dispatch.Status
+	}
+	if ps.Session.Model == "" {
+		ps.Session.Model = dispatch.Model
+	}
+	if ps.Session.CreatedAt == 0 && dispatch.DispatchCreatedAt > 0 {
+		ps.Session.CreatedAt = dispatch.DispatchCreatedAt
+	}
+	ps.Session.MessageCount = len(ps.Messages)
+	ps.RawJSON = chooseRawJSON(ps.RawJSON, dispatch)
+
+	if ps.Session.Model != "" {
+		for i := range ps.Turns {
+			if ps.Turns[i].Model == "" {
+				ps.Turns[i].Model = ps.Session.Model
+			}
+		}
+	}
+}
+
+func rewriteParsedSessionID(ps *ParsedSession, newID string) {
+	if ps == nil || newID == "" {
+		return
+	}
+	ps.Session.ID = newID
+	for i := range ps.Messages {
+		ps.Messages[i].SessionID = newID
+	}
+	for i := range ps.Capabilities {
+		ps.Capabilities[i].SessionID = newID
+	}
+	for i := range ps.Lints {
+		ps.Lints[i].SessionID = newID
+	}
+	for i := range ps.MessageFiles {
+		ps.MessageFiles[i].SessionID = newID
+	}
+	for i := range ps.Codeblocks {
+		ps.Codeblocks[i].SessionID = newID
+	}
+	for i := range ps.ToolCalls {
+		ps.ToolCalls[i].SessionID = newID
+	}
+	for i := range ps.Turns {
+		ps.Turns[i].SessionID = newID
+	}
+}
+
+func chooseParsedSession(a, b *ParsedSession) *ParsedSession {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	if len(b.Messages) > len(a.Messages) {
+		return b
+	}
+	if len(b.Messages) < len(a.Messages) {
+		return a
+	}
+	if len(b.MessageMetadata) > len(a.MessageMetadata) {
+		return b
+	}
+	return a
+}
+
+func chooseRawJSON(existing string, dispatch *TaskDispatch) string {
+	if existing != "" || dispatch == nil {
+		return existing
+	}
+	raw := map[string]string{
+		"tool_call_id":  dispatch.ToolCallID,
+		"description":   dispatch.Description,
+		"model":         dispatch.Model,
+		"status":        dispatch.Status,
+		"params_json":   dispatch.ParamsJSON,
+		"result_json":   dispatch.ResultJSON,
+		"prompt":        dispatch.Prompt,
+		"parent_session": dispatch.ParentSessionID,
+		"parent_message": dispatch.ParentMessageID,
+	}
+	if b, err := json.Marshal(raw); err == nil {
+		return string(b)
+	}
+	return existing
+}
+
+func buildMinimalSubagentSession(toolCallID string, dispatch *TaskDispatch) *ParsedSession {
+	if toolCallID == "" {
+		return nil
+	}
+	sessionID := "task-" + toolCallID
+	session := models.Session{
+		ID:           sessionID,
+		Source:       "cursor",
+		CreatedAt:    0,
+		MessageCount: 0,
+		IsSubagent:   true,
+		ToolCallID:   toolCallID,
+	}
+	if dispatch != nil {
+		session.ParentSessionID = dispatch.ParentSessionID
+		session.ParentMessageID = dispatch.ParentMessageID
+		session.TaskDescription = dispatch.Description
+		session.TaskStatus = dispatch.Status
+		session.Model = dispatch.Model
+		if dispatch.DispatchCreatedAt > 0 {
+			session.CreatedAt = dispatch.DispatchCreatedAt
+		}
+	}
+	return &ParsedSession{
+		Session:         session,
+		Messages:        nil,
+		MessageMetadata: map[string]string{},
+		Capabilities:    nil,
+		Lints:           nil,
+		MessageFiles:    nil,
+		Codeblocks:      nil,
+		ToolCalls:       nil,
+		Turns:           nil,
+		Files:           nil,
+		RawJSON:         chooseRawJSON("", dispatch),
+	}
+}
+
+func parseTaskSessionFromBubbles(toolCallID string, bubbleCache map[string]string) (*ParsedSession, map[string]string) {
+	if toolCallID == "" || len(bubbleCache) == 0 {
+		return nil, nil
+	}
+	sessionID := "task-" + toolCallID
+
+	type bubbleEntry struct {
+		id        string
+		value     string
+		timestamp int64
+	}
+	entries := make([]bubbleEntry, 0, len(bubbleCache))
+	for key, value := range bubbleCache {
+		parts := strings.SplitN(key, ":", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		bubbleID := parts[2]
+		ts := bubbleTimestampMillis(bubbleID, value)
+		entries = append(entries, bubbleEntry{id: bubbleID, value: value, timestamp: ts})
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].timestamp == entries[j].timestamp {
+			return entries[i].id < entries[j].id
+		}
+		if entries[i].timestamp == 0 {
+			return false
+		}
+		if entries[j].timestamp == 0 {
+			return true
+		}
+		return entries[i].timestamp < entries[j].timestamp
+	})
+
+	bubbleJSONs := make(map[string]string, len(entries))
+	meta := make(map[string]string, len(entries))
+	var messages []models.Message
+	var caps []MessageCapability
+	var lints []MessageLint
+	var mfiles []MessageFileRef
+	var codeblocks []MessageCodeblock
+	var toolCalls []models.ToolCall
+	var createdAt int64
+
+	for i, entry := range entries {
+		bubbleJSONs[entry.id] = entry.value
+		msg := models.Message{
+			ID:        entry.id,
+			SessionID: sessionID,
+			Sequence:  i,
+			Timestamp: entry.timestamp,
+		}
+		if msg.Timestamp == 0 && createdAt > 0 {
+			msg.Timestamp = createdAt
+		}
+		msgType := int(gjson.Get(entry.value, "type").Int())
+		switch msgType {
+		case 1:
+			msg.Role = "user"
+		case 2:
+			msg.Role = "assistant"
+		default:
+			msg.Role = "unknown"
+		}
+		text := gjson.Get(entry.value, "text").String()
+		if text == "" {
+			text = gjson.Get(entry.value, "rawText").String()
+		}
+		msg.Content = text
+		msg.CheckpointID = gjson.Get(entry.value, "checkpointId").String()
+		msg.IsAgentic = gjson.Get(entry.value, "isAgentic").Bool()
+		msg.IsPlanExecution = gjson.Get(entry.value, "isPlanExecution").Bool()
+		if ctx := gjson.Get(entry.value, "context"); ctx.Exists() {
+			msg.ContextJSON = ctx.Raw
+		}
+		if rules := gjson.Get(entry.value, "cursorRules"); rules.Exists() && rules.IsArray() && len(rules.Array()) > 0 {
+			msg.CursorRulesJSON = rules.Raw
+		}
+		bubbleCaps, bubbleLints, bubbleFiles, bubbleCBs := extractBubbleMetadataJSON(sessionID, entry.id, entry.value)
+		caps = append(caps, bubbleCaps...)
+		lints = append(lints, bubbleLints...)
+		mfiles = append(mfiles, bubbleFiles...)
+		codeblocks = append(codeblocks, bubbleCBs...)
+		meta[entry.id] = entry.value
+		toolCalls = append(toolCalls, extractToolCallsFromBubble(sessionID, entry.id, entry.value)...)
+		messages = append(messages, msg)
+		if createdAt == 0 && msg.Timestamp > 0 {
+			createdAt = msg.Timestamp
+		}
+	}
+
+	session := models.Session{
+		ID:           sessionID,
+		Source:       "cursor",
+		CreatedAt:    createdAt,
+		MessageCount: len(messages),
+	}
+	turns := buildTurnsForSession(&session, messages, toolCalls)
+
+	return &ParsedSession{
+		Session:         session,
+		Messages:        messages,
+		MessageMetadata: meta,
+		Capabilities:    caps,
+		Lints:           lints,
+		MessageFiles:    mfiles,
+		Codeblocks:      codeblocks,
+		ToolCalls:       toolCalls,
+		Turns:           turns,
+		Files:           nil,
+		RawJSON:         "",
+	}, bubbleJSONs
+}
+
+func exportBubblesForSession(bubblesDir, bubbleExportMode, sessionID string, bubbles map[string]string) error {
+	if bubblesDir == "" || len(bubbles) == 0 {
+		return nil
+	}
+	sessionBubbleDir := filepath.Join(bubblesDir, sessionID)
+	if err := os.MkdirAll(sessionBubbleDir, 0755); err != nil {
+		return err
+	}
+	if bubbleExportMode == "jsonl" {
+		_, err := exportBubblesJSONL(sessionBubbleDir, bubbles)
+		return err
+	}
+	for bubbleID, bubbleJSON := range bubbles {
+		bubbleFile := filepath.Join(sessionBubbleDir, bubbleID+".json")
+		redactedBubble := RedactJSON(bubbleJSON)
+		if err := os.WriteFile(bubbleFile, []byte(redactedBubble), 0644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // parseSession parses a single session, handling both old and new formats
@@ -630,6 +1106,28 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 	// Extract model from modelConfig (fast)
 	model := gjson.Get(value, "modelConfig.modelName").String()
 
+	// Extract new session-level metadata
+	contextTokenLimit := int(gjson.Get(value, "contextTokenLimit").Int())
+	contextTokensUsed := int(gjson.Get(value, "contextTokensUsed").Int())
+	isAgentic := gjson.Get(value, "isAgentic").Bool()
+	forceMode := gjson.Get(value, "forceMode").String()
+	conversationState := gjson.Get(value, "conversationState").String()
+
+	// Extract workspace path from context.fileSelections or context.folderSelections
+	workspacePath := ""
+	if fs := gjson.Get(value, "context.fileSelections.0.uri.fsPath").String(); fs != "" {
+		// Extract workspace root from file path (find common prefix)
+		workspacePath = extractWorkspaceFromPath(fs)
+	} else if fs := gjson.Get(value, "context.folderSelections.0.absolutePath").String(); fs != "" {
+		workspacePath = fs
+	}
+
+	// Extract session-level context as JSON (fileSelections, folderSelections, etc.)
+	contextJSON := ""
+	if ctx := gjson.Get(value, "context"); ctx.Exists() {
+		contextJSON = ctx.Raw
+	}
+
 	// Project + session-level files:
 	// - For new format: extract without unmarshalling
 	// - For old format: fall back to existing map-based helpers
@@ -648,12 +1146,24 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 		files = extractFilesFromRaw(raw)
 	}
 
+	// Use extracted workspace path if project inference failed
+	if project == "" && workspacePath != "" {
+		project = workspacePath
+	}
+
 	session := models.Session{
-		ID:        composerID,
-		Source:    "cursor",
-		Project:   project,
-		Model:     model,
-		CreatedAt: createdAt,
+		ID:                composerID,
+		Source:            "cursor",
+		Project:           project,
+		Model:             model,
+		CreatedAt:         createdAt,
+		ContextTokenLimit: contextTokenLimit,
+		ContextTokensUsed: contextTokensUsed,
+		IsAgentic:         isAgentic,
+		ForceMode:         forceMode,
+		WorkspacePath:     workspacePath,
+		ContextJSON:       contextJSON,
+		ConversationState: conversationState,
 	}
 
 	var messages []models.Message
@@ -662,6 +1172,8 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 	var lints []MessageLint
 	var mfiles []MessageFileRef
 	var codeblocks []MessageCodeblock
+	var toolCalls []models.ToolCall
+	var turns []models.Turn
 
 	if hasOldFormat && !hasNewFormat {
 		conversation, _ := raw["conversation"].([]interface{})
@@ -672,7 +1184,9 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 				convMaps = append(convMaps, m)
 			}
 		}
-		messages, meta, caps, lints, mfiles, codeblocks = parseMessages(composerID, createdAt, convMaps)
+		var oldToolCalls []models.ToolCall
+		messages, meta, caps, lints, mfiles, codeblocks, oldToolCalls = parseMessages(composerID, createdAt, convMaps)
+		toolCalls = append(toolCalls, oldToolCalls...)
 
 	} else if hasNewFormat {
 		// NEW FORMAT: headers only in composerData, content in bubbleId:* keys
@@ -734,6 +1248,21 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 				}
 				msg.Content = text
 
+				// Extract new per-message metadata fields
+				msg.CheckpointID = gjson.Get(bubbleValue, "checkpointId").String()
+				msg.IsAgentic = gjson.Get(bubbleValue, "isAgentic").Bool()
+				msg.IsPlanExecution = gjson.Get(bubbleValue, "isPlanExecution").Bool()
+
+				// Per-message context (fileSelections, folderSelections, mentions, etc.)
+				if ctx := gjson.Get(bubbleValue, "context"); ctx.Exists() {
+					msg.ContextJSON = ctx.Raw
+				}
+
+				// Cursor rules in effect for this message
+				if rules := gjson.Get(bubbleValue, "cursorRules"); rules.Exists() && rules.IsArray() && len(rules.Array()) > 0 {
+					msg.CursorRulesJSON = rules.Raw
+				}
+
 				// Extract metadata, capabilities, lints, files from bubble (no json.Unmarshal)
 				bubbleCaps, bubbleLints, bubbleFiles, bubbleCBs := extractBubbleMetadataJSON(composerID, bubbleID, bubbleValue)
 				caps = append(caps, bubbleCaps...)
@@ -743,9 +1272,39 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 
 				// Store raw metadata (bubble JSON)
 				meta[bubbleID] = bubbleValue
+
+				// Tool calls (toolFormerData)
+				toolCalls = append(toolCalls, extractToolCallsFromBubble(composerID, bubbleID, bubbleValue)...)
+			}
+
+			// Check for task_v2 tool calls that spawn subagents
+			if dispatch := extractTaskDispatchFromBubble(composerID, bubbleID, bubbleValue); dispatch != nil {
+				p.taskDispatchesMu.Lock()
+				if p.taskDispatches != nil {
+					p.taskDispatches[dispatch.ToolCallID] = dispatch
+				}
+				p.taskDispatchesMu.Unlock()
 			}
 
 			messages = append(messages, msg)
+		}
+		// Capture orphaned task dispatches not present in headers
+		for bubbleKey, bubbleValue := range bubbleCache {
+			if !strings.HasPrefix(bubbleKey, "bubbleId:"+composerID+":") {
+				continue
+			}
+			parts := strings.SplitN(bubbleKey, ":", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			bubbleID := parts[2]
+			if dispatch := extractTaskDispatchFromBubble(composerID, bubbleID, bubbleValue); dispatch != nil {
+				p.taskDispatchesMu.Lock()
+				if p.taskDispatches != nil {
+					p.taskDispatches[dispatch.ToolCallID] = dispatch
+				}
+				p.taskDispatchesMu.Unlock()
+			}
 		}
 	} else {
 		// No conversation data - skip or create minimal session
@@ -753,6 +1312,7 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 	}
 
 	session.MessageCount = len(messages)
+	turns = buildTurnsForSession(&session, messages, toolCalls)
 
 	return &ParsedSession{
 		Session:         session,
@@ -762,9 +1322,134 @@ func (p *CursorDBParser) parseSessionWithBubblesFromCache(bubbleCache map[string
 		Lints:           lints,
 		MessageFiles:    mfiles,
 		Codeblocks:      codeblocks,
+		ToolCalls:       toolCalls,
+		Turns:           turns,
 		Files:           files,
 		RawJSON:         value,
 	}, bubbleJSONs, nil
+}
+
+// extractTaskDispatchFromBubble extracts task_v2 tool calls from a bubble's toolFormerData
+// Returns nil if no task dispatch is found
+func extractTaskDispatchFromBubble(sessionID, messageID, bubbleJSON string) *TaskDispatch {
+	// Look for toolFormerData with name "task_v2"
+	tfd := gjson.Get(bubbleJSON, "toolFormerData")
+	if !tfd.Exists() {
+		return nil
+	}
+
+	name := tfd.Get("name").String()
+	if name != "task_v2" && name != "task" {
+		return nil
+	}
+
+	toolCallID := tfd.Get("toolCallId").String()
+	if toolCallID == "" {
+		return nil
+	}
+
+	paramsJSON := normalizeToolFormerPayload(tfd.Get("params"))
+	description := gjson.Get(paramsJSON, "description").String()
+	model := gjson.Get(paramsJSON, "model").String()
+	prompt := gjson.Get(paramsJSON, "prompt").String()
+	resultJSON := normalizeToolFormerPayload(tfd.Get("result"))
+	status := tfd.Get("status").String()
+	if status == "" {
+		status = tfd.Get("additionalData.status").String()
+	}
+
+	// Check for embedded composerData
+	embeddedComposerData := tfd.Get("additionalData.composerData").String()
+
+	return &TaskDispatch{
+		ToolCallID:           toolCallID,
+		ParentSessionID:      sessionID,
+		ParentMessageID:      messageID,
+		Description:          description,
+		Model:                model,
+		Status:               status,
+		Prompt:               prompt,
+		ParamsJSON:           paramsJSON,
+		ResultJSON:           resultJSON,
+		DispatchCreatedAt:    bubbleTimestampMillis(messageID, bubbleJSON),
+		EmbeddedComposerData: embeddedComposerData,
+	}
+}
+
+func extractToolCallsFromBubble(sessionID, messageID, bubbleJSON string) []models.ToolCall {
+	tfd := gjson.Get(bubbleJSON, "toolFormerData")
+	if !tfd.Exists() {
+		return nil
+	}
+	var out []models.ToolCall
+	if tfd.IsArray() {
+		for _, item := range tfd.Array() {
+			if tc := buildToolCallFromToolFormerData(sessionID, messageID, item); tc != nil {
+				out = append(out, *tc)
+			}
+		}
+		return out
+	}
+	if tc := buildToolCallFromToolFormerData(sessionID, messageID, tfd); tc != nil {
+		out = append(out, *tc)
+	}
+	return out
+}
+
+func buildToolCallFromToolFormerData(sessionID, messageID string, tfd gjson.Result) *models.ToolCall {
+	toolCallID := tfd.Get("toolCallId").String()
+	if toolCallID == "" {
+		return nil
+	}
+	toolName := tfd.Get("name").String()
+	status := tfd.Get("status").String()
+	if status == "" {
+		status = tfd.Get("additionalData.status").String()
+	}
+	childSessionID := ""
+	if toolName == "task_v2" || toolName == "task" {
+		childSessionID = "task-" + toolCallID
+	}
+	return &models.ToolCall{
+		ID:             toolCallID,
+		MessageID:      messageID,
+		SessionID:      sessionID,
+		ToolName:       toolName,
+		ToolNumber:     int(tfd.Get("tool").Int()),
+		ParamsJSON:     normalizeToolFormerPayload(tfd.Get("params")),
+		ResultJSON:     normalizeToolFormerPayload(tfd.Get("result")),
+		Status:         status,
+		ChildSessionID: childSessionID,
+	}
+}
+
+func normalizeToolFormerPayload(val gjson.Result) string {
+	if !val.Exists() {
+		return ""
+	}
+	if val.Type == gjson.String {
+		return strings.TrimSpace(val.String())
+	}
+	return strings.TrimSpace(val.Raw)
+}
+
+func bubbleTimestampMillis(bubbleID, bubbleJSON string) int64 {
+	if bubbleJSON != "" {
+		if bubbleCreatedAt := gjson.Get(bubbleJSON, "createdAt").String(); bubbleCreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, bubbleCreatedAt); err == nil {
+				return t.UnixMilli()
+			}
+			if t, err := time.Parse("2006-01-02T15:04:05.999Z", bubbleCreatedAt); err == nil {
+				return t.UnixMilli()
+			}
+		}
+	}
+	if bubbleID != "" {
+		if ts, ok := uuidV7TimestampMillis(bubbleID); ok {
+			return ts
+		}
+	}
+	return 0
 }
 
 // extractBubbleMetadataJSON extracts capabilities, lints, files from raw bubble JSON without unmarshalling.
@@ -943,6 +1628,34 @@ func extractFilesFromComposerJSON(raw string) []string {
 	}
 
 	return out
+}
+
+// extractWorkspaceFromPath tries to find the workspace root from a file path
+// by looking for common project markers (go.mod, package.json, .git, etc.)
+func extractWorkspaceFromPath(filePath string) string {
+	if filePath == "" {
+		return ""
+	}
+	// Walk up the path looking for project markers
+	parts := strings.Split(filePath, "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := strings.Join(parts[:i+1], "/")
+		// Check common patterns
+		for _, marker := range []string{".git", "go.mod", "package.json", "Cargo.toml", "pyproject.toml", "setup.py"} {
+			if _, err := os.Stat(candidate + "/" + marker); err == nil {
+				return candidate
+			}
+		}
+		// Common workspace directory names
+		if parts[i] == "nexus" || parts[i] == "projects" || parts[i] == "src" || parts[i] == "home" {
+			return candidate
+		}
+	}
+	// Fall back to first few path components
+	if len(parts) > 4 {
+		return strings.Join(parts[:4], "/")
+	}
+	return filePath
 }
 
 // extractBubbleMetadata extracts capabilities, lints, files from a bubble

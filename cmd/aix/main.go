@@ -360,6 +360,18 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 									}
 								}
 							}
+							for _, tc := range ps.ToolCalls {
+								tcCopy := tc
+								if err := batch.InsertToolCall(&tcCopy); err != nil {
+									errs = append(errs, fmt.Errorf("error saving tool call %s: %w", tc.ID, err))
+								}
+							}
+							for _, t := range ps.Turns {
+								turnCopy := t
+								if err := batch.InsertTurn(&turnCopy); err != nil {
+									errs = append(errs, fmt.Errorf("error saving turn %s: %w", t.ID, err))
+								}
+							}
 							for _, c := range ps.Capabilities {
 								if err := batch.InsertMessageCapability(c.MessageID, c.SessionID, c.Phase, c.Capability); err != nil {
 									errs = append(errs, fmt.Errorf("error saving capability %s: %w", c.MessageID, err))
@@ -533,6 +545,8 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 						var allLints []sync.MessageLint
 						var allMsgFiles []sync.MessageFileRef
 						var allCodeblocks []sync.MessageCodeblock
+						var allToolCalls []models.ToolCall
+						var allTurns []models.Turn
 
 						for _, ps := range sessions {
 							// Upsert session
@@ -561,6 +575,8 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 							allLints = append(allLints, ps.Lints...)
 							allMsgFiles = append(allMsgFiles, ps.MessageFiles...)
 							allCodeblocks = append(allCodeblocks, ps.Codeblocks...)
+							allToolCalls = append(allToolCalls, ps.ToolCalls...)
+							allTurns = append(allTurns, ps.Turns...)
 
 							// Collect file refs
 							for _, file := range ps.Files {
@@ -577,6 +593,20 @@ Sessions are exported to ~/nexus/home/sessions/ for durability before importing.
 						// Insert messages FIRST (foreign key parent)
 						for _, msg := range allMessages {
 							if err := batch.InsertMessage(&msg); err != nil {
+								errors++
+							}
+						}
+
+						// Insert tool calls and turns (depend on messages)
+						for _, tc := range allToolCalls {
+							tcCopy := tc
+							if err := batch.InsertToolCall(&tcCopy); err != nil {
+								errors++
+							}
+						}
+						for _, t := range allTurns {
+							turnCopy := t
+							if err := batch.InsertTurn(&turnCopy); err != nil {
 								errors++
 							}
 						}

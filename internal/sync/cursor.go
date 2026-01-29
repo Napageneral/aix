@@ -79,6 +79,8 @@ type ParsedSession struct {
 	Lints           []MessageLint
 	MessageFiles    []MessageFileRef
 	Codeblocks      []MessageCodeblock
+	ToolCalls       []models.ToolCall
+	Turns           []models.Turn
 	Files           []string
 	RawJSON         string
 }
@@ -176,8 +178,10 @@ func (p *CursorParser) ParseFile(filePath string) (*ParsedSession, error) {
 	}
 
 	// Parse messages
-	messages, meta, caps, lints, mfiles, cbs := parseMessages(composer.ComposerID, session.CreatedAt, composer.Conversation)
+	messages, meta, caps, lints, mfiles, cbs, toolCalls := parseMessages(composer.ComposerID, session.CreatedAt, composer.Conversation)
 	session.MessageCount = len(messages)
+
+	turns := buildTurnsForSession(&session, messages, toolCalls)
 
 	// Collect file references
 	files := collectFiles(composer)
@@ -190,6 +194,8 @@ func (p *CursorParser) ParseFile(filePath string) (*ParsedSession, error) {
 		Lints:           lints,
 		MessageFiles:    mfiles,
 		Codeblocks:      cbs,
+		ToolCalls:       toolCalls,
+		Turns:           turns,
 		Files:           files,
 		RawJSON:         string(data),
 	}, nil
@@ -252,6 +258,8 @@ func salvageSession(filePath string, raw []byte) *ParsedSession {
 		Lints:           nil,
 		MessageFiles:    nil,
 		Codeblocks:      nil,
+		ToolCalls:       nil,
+		Turns:           nil,
 		Files:           nil,
 		RawJSON:         string(raw),
 	}
@@ -569,13 +577,14 @@ func inferProjectFromPath(path string) string {
 }
 
 // parseMessages extracts messages from conversation items
-func parseMessages(sessionID string, sessionCreatedAt int64, conversation []map[string]interface{}) ([]models.Message, map[string]string, []MessageCapability, []MessageLint, []MessageFileRef, []MessageCodeblock) {
+func parseMessages(sessionID string, sessionCreatedAt int64, conversation []map[string]interface{}) ([]models.Message, map[string]string, []MessageCapability, []MessageLint, []MessageFileRef, []MessageCodeblock, []models.ToolCall) {
 	var messages []models.Message
 	meta := make(map[string]string)
 	var caps []MessageCapability
 	var lints []MessageLint
 	var files []MessageFileRef
 	var codeblocks []MessageCodeblock
+	var toolCalls []models.ToolCall
 
 	for i, item := range conversation {
 		msg := models.Message{
@@ -660,6 +669,13 @@ func parseMessages(sessionID string, sessionCreatedAt int64, conversation []map[
 		if len(m) > 0 && msg.ID != "" {
 			if b, err := json.Marshal(m); err == nil {
 				meta[msg.ID] = string(b)
+			}
+		}
+
+		// Tool calls (if present in old format)
+		if msg.ID != "" {
+			if b, err := json.Marshal(item); err == nil {
+				toolCalls = append(toolCalls, extractToolCallsFromBubble(sessionID, msg.ID, string(b))...)
 			}
 		}
 
@@ -810,7 +826,7 @@ func parseMessages(sessionID string, sessionCreatedAt int64, conversation []map[
 		}
 	}
 
-	return messages, meta, caps, lints, files, codeblocks
+	return messages, meta, caps, lints, files, codeblocks, toolCalls
 }
 
 func getFloat(v interface{}) float64 {

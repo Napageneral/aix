@@ -116,9 +116,10 @@ func (p *CursorDBParser) ParseAllStreaming(exportStats *ExportStats, bubbleExpor
 			defer close(sessionCh)
 			defer db.Close()
 
+			// Exclude task sessions - they're handled separately after regular sessions
 			rows, err := db.Query(
 				`SELECT rowid, key, value FROM cursorDiskKV
-				 WHERE key LIKE 'composerData:%' AND value IS NOT NULL AND rowid > ?`,
+				 WHERE key LIKE 'composerData:%' AND key NOT LIKE 'composerData:task-%' AND value IS NOT NULL AND rowid > ?`,
 				p.sinceRowID,
 			)
 			if err != nil {
@@ -269,6 +270,15 @@ func (p *CursorDBParser) ParseAllStreaming(exportStats *ExportStats, bubbleExpor
 				sessionCh <- &ParsedSessionStream{Session: session}
 			}
 
+			// Parse task sessions (subagents) after main sessions
+			taskSessions, taskErrors := p.parseTaskSessions(db, bubblesDir, bubbleExportMode)
+			for _, err := range taskErrors {
+				sessionCh <- &ParsedSessionStream{Error: err}
+			}
+			for _, ps := range taskSessions {
+				sessionCh <- &ParsedSessionStream{Session: ps}
+			}
+
 			if exportStats != nil {
 				exportStats.ComposerFiles = int(atomic.LoadInt64(&composerCount64))
 				exportStats.ComposerFilesSkipped = int(atomic.LoadInt64(&composerSkipped64))
@@ -294,7 +304,8 @@ func (p *CursorDBParser) ParseAllStreaming(exportStats *ExportStats, bubbleExpor
 		var entriesToProcess []sessionEntry
 		changedSessionIDs := make(map[string]bool)
 
-		rows1, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value IS NOT NULL`)
+		// Exclude task sessions (composerData:task-*) from regular processing - they're handled separately
+		rows1, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND key NOT LIKE 'composerData:task-%' AND value IS NOT NULL`)
 		if err != nil {
 			sessionCh <- &ParsedSessionStream{Error: fmt.Errorf("failed to query sessions: %w", err)}
 			return
@@ -414,6 +425,15 @@ func (p *CursorDBParser) ParseAllStreaming(exportStats *ExportStats, bubbleExpor
 		}
 		close(jobs)
 		workerWg.Wait()
+
+		// Parse task sessions (subagents) after main sessions
+		taskSessions, taskErrors := p.parseTaskSessions(db, bubblesDir, bubbleExportMode)
+		for _, err := range taskErrors {
+			sessionCh <- &ParsedSessionStream{Error: err}
+		}
+		for _, ps := range taskSessions {
+			sessionCh <- &ParsedSessionStream{Session: ps}
+		}
 
 		if exportStats != nil {
 			exportStats.ComposerFiles = int(atomic.LoadInt64(&composerCount64))
