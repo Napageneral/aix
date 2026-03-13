@@ -1,0 +1,331 @@
+{
+  "id": "aix",
+  "version": "1.0.3",
+  "displayName": "AIX",
+  "description": "Collect, aggregate, and review AI session history from distributed engineer devices.",
+  "handler": "methods/index.ts",
+  "ui": {
+    "root": "dist",
+    "entryPath": "/app/aix/",
+    "spa": true
+  },
+  "hooks": {
+    "onInstall": "hooks/install.ts",
+    "onUpgrade": "hooks/upgrade.ts"
+  },
+  "product": {
+    "tagline": "Collect and archive distributed AI session history",
+    "accentColor": "#0f766e"
+  },
+  "methods": {
+    "aix.credentials.issue": {
+      "description": "Issue an entity-bound AIX client token and setup bundle.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["entityId", "preset"],
+        "properties": {
+          "entityId": { "type": "string" },
+          "preset": { "type": "string", "enum": ["offboarding", "ongoing"] },
+          "label": { "type": "string" },
+          "expiresAt": { "type": "number" },
+          "providerAllowlist": { "type": "array", "items": { "type": "string" } },
+          "defaultMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
+          "defaultCadence": { "type": "string", "enum": ["manual", "five_minutes", "ten_minutes", "daily", "live"] },
+          "runtimeBaseUrl": { "type": "string" }
+        }
+      }
+    },
+    "aix.credentials.list": {
+      "description": "List issued AIX client credentials.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityId": { "type": "string" },
+          "includeRevoked": { "type": "boolean" },
+          "includeExpired": { "type": "boolean" },
+          "limit": { "type": "number" }
+        }
+      }
+    },
+    "aix.credentials.revoke": {
+      "description": "Revoke an issued AIX client credential.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    },
+    "aix.credentials.rotate": {
+      "description": "Rotate an issued AIX client credential.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "expiresAt": { "type": "number" },
+          "runtimeBaseUrl": { "type": "string" }
+        }
+      }
+    },
+    "aix.entities.list": {
+      "description": "List candidate engineer entities for AIX token issuance.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "number" },
+          "offset": { "type": "number" },
+          "type": { "type": "string" },
+          "isUser": { "type": "boolean" }
+        }
+      }
+    },
+    "aix.sources.list": {
+      "description": "List AIX sources for the tenant.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityId": { "type": "string" },
+          "status": { "type": "string", "enum": ["active", "paused", "revoked", "error"] },
+          "provider": { "type": "string" },
+          "limit": { "type": "number" }
+        }
+      }
+    },
+    "aix.sources.get": {
+      "description": "Get a single AIX source.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId"],
+        "properties": {
+          "sourceId": { "type": "string" }
+        }
+      }
+    },
+    "aix.sources.update": {
+      "description": "Update source label or cadence settings.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "label": { "type": "string" },
+          "status": { "type": "string", "enum": ["active", "paused", "revoked"] },
+          "defaultMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
+          "expectedCadence": { "type": "string", "enum": ["manual", "five_minutes", "ten_minutes", "daily", "live"] }
+        }
+      }
+    },
+    "aix.sources.register": {
+      "description": "Register or reconnect an AIX install for the authenticated engineer.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["installId", "clientDeviceId", "clientVersion", "providers"],
+        "properties": {
+          "installId": { "type": "string" },
+          "clientDeviceId": { "type": "string" },
+          "hostname": { "type": "string" },
+          "platform": { "type": "string" },
+          "arch": { "type": "string" },
+          "osVersion": { "type": "string" },
+          "clientVersion": { "type": "string" },
+          "label": { "type": "string" },
+          "defaultMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
+          "expectedCadence": { "type": "string", "enum": ["manual", "five_minutes", "ten_minutes", "daily", "live"] },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["provider", "enabled"],
+              "properties": {
+                "provider": { "type": "string" },
+                "enabled": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "aix.runs.list": {
+      "description": "List AIX external runs.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityId": { "type": "string" },
+          "sourceId": { "type": "string" },
+          "status": { "type": "string", "enum": ["running", "completed", "completed_empty", "failed", "partial"] },
+          "limit": { "type": "number" }
+        }
+      }
+    },
+    "aix.runs.get": {
+      "description": "Get one AIX external run.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["runId"],
+        "properties": {
+          "runId": { "type": "string" }
+        }
+      }
+    },
+    "aix.imported-sessions.list": {
+      "description": "List imported sessions written into the AIX archive workspace.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityId": { "type": "string" },
+          "sourceId": { "type": "string" },
+          "provider": { "type": "string" },
+          "limit": { "type": "number" },
+          "cursor": { "type": "string" }
+        }
+      }
+    },
+    "aix.runs.begin": {
+      "description": "Begin or resume an external AIX run.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId", "clientRunId", "triggerKind", "runMode", "clientVersion"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "clientRunId": { "type": "string" },
+          "triggerKind": { "type": "string", "enum": ["manual", "scheduled", "live", "resume"] },
+          "runMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
+          "clientVersion": { "type": "string" },
+          "providerSummary": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["provider", "sessionsSeen", "sessionsChanged"],
+              "properties": {
+                "provider": { "type": "string" },
+                "sessionsSeen": { "type": "number" },
+                "sessionsChanged": { "type": "number" }
+              }
+            }
+          },
+          "checkpoint": { "type": "object" }
+        }
+      }
+    },
+    "aix.runs.complete": {
+      "description": "Complete an external AIX run and roll up source health.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId", "runId", "status", "sessionsSeen", "sessionsChanged", "imported", "upserted", "skipped", "failed", "bytesUploaded", "uploadCount"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "runId": { "type": "string" },
+          "status": { "type": "string", "enum": ["completed", "completed_empty", "failed", "partial"] },
+          "sessionsSeen": { "type": "number" },
+          "sessionsChanged": { "type": "number" },
+          "imported": { "type": "number" },
+          "upserted": { "type": "number" },
+          "skipped": { "type": "number" },
+          "failed": { "type": "number" },
+          "bytesUploaded": { "type": "number" },
+          "uploadCount": { "type": "number" },
+          "checkpoint": { "type": "object" },
+          "errorCode": { "type": "string" },
+          "errorMessage": { "type": "string" }
+        }
+      }
+    },
+    "aix.uploads.begin": {
+      "description": "Create or resume a resumable AIX upload.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId", "runId", "uploadId", "contentKind", "payloadSha256", "chunkTotal", "bytesTotal", "itemCount"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "runId": { "type": "string" },
+          "uploadId": { "type": "string" },
+          "contentKind": { "type": "string", "enum": ["sessions.batch"] },
+          "payloadSha256": { "type": "string" },
+          "chunkTotal": { "type": "number" },
+          "bytesTotal": { "type": "number" },
+          "itemCount": { "type": "number" }
+        }
+      }
+    },
+    "aix.uploads.chunk": {
+      "description": "Upload one resumable AIX payload chunk.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId", "runId", "uploadId", "chunkIndex", "chunkTotal", "payloadSha256", "encoding", "data"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "runId": { "type": "string" },
+          "uploadId": { "type": "string" },
+          "chunkIndex": { "type": "number" },
+          "chunkTotal": { "type": "number" },
+          "payloadSha256": { "type": "string" },
+          "encoding": { "type": "string", "enum": ["gzip+base64"] },
+          "data": { "type": "string" }
+        }
+      }
+    },
+    "aix.uploads.status": {
+      "description": "Get upload resume status for an AIX upload.",
+      "action": "read",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId", "runId", "uploadId"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "runId": { "type": "string" },
+          "uploadId": { "type": "string" }
+        }
+      }
+    },
+    "aix.uploads.complete": {
+      "description": "Finalize a resumable AIX upload into agents.db.",
+      "action": "write",
+      "access": "authenticated",
+      "params": {
+        "type": "object",
+        "required": ["sourceId", "runId", "uploadId"],
+        "properties": {
+          "sourceId": { "type": "string" },
+          "runId": { "type": "string" },
+          "uploadId": { "type": "string" }
+        }
+      }
+    }
+  }
+}
