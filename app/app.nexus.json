@@ -24,16 +24,54 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["entityId", "preset"],
+        "required": [
+          "entityId",
+          "preset"
+        ],
         "properties": {
-          "entityId": { "type": "string" },
-          "preset": { "type": "string", "enum": ["offboarding", "ongoing"] },
-          "label": { "type": "string" },
-          "expiresAt": { "type": "number" },
-          "providerAllowlist": { "type": "array", "items": { "type": "string" } },
-          "defaultMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
-          "defaultCadence": { "type": "string", "enum": ["manual", "five_minutes", "ten_minutes", "daily", "live"] },
-          "runtimeBaseUrl": { "type": "string" }
+          "entityId": {
+            "type": "string"
+          },
+          "preset": {
+            "type": "string",
+            "enum": [
+              "offboarding",
+              "ongoing"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "number"
+          },
+          "providerAllowlist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "defaultMode": {
+            "type": "string",
+            "enum": [
+              "backfill",
+              "incremental",
+              "live"
+            ]
+          },
+          "defaultCadence": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "five_minutes",
+              "ten_minutes",
+              "daily",
+              "live"
+            ]
+          },
+          "runtimeBaseUrl": {
+            "type": "string"
+          }
         }
       }
     },
@@ -44,10 +82,18 @@
       "params": {
         "type": "object",
         "properties": {
-          "entityId": { "type": "string" },
-          "includeRevoked": { "type": "boolean" },
-          "includeExpired": { "type": "boolean" },
-          "limit": { "type": "number" }
+          "entityId": {
+            "type": "string"
+          },
+          "includeRevoked": {
+            "type": "boolean"
+          },
+          "includeExpired": {
+            "type": "boolean"
+          },
+          "limit": {
+            "type": "number"
+          }
         }
       }
     },
@@ -57,9 +103,13 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["id"],
+        "required": [
+          "id"
+        ],
         "properties": {
-          "id": { "type": "string" }
+          "id": {
+            "type": "string"
+          }
         }
       }
     },
@@ -69,12 +119,22 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["id"],
+        "required": [
+          "id"
+        ],
         "properties": {
-          "id": { "type": "string" },
-          "label": { "type": "string" },
-          "expiresAt": { "type": "number" },
-          "runtimeBaseUrl": { "type": "string" }
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "number"
+          },
+          "runtimeBaseUrl": {
+            "type": "string"
+          }
         }
       }
     },
@@ -85,10 +145,18 @@
       "params": {
         "type": "object",
         "properties": {
-          "limit": { "type": "number" },
-          "offset": { "type": "number" },
-          "type": { "type": "string" },
-          "isUser": { "type": "boolean" }
+          "limit": {
+            "type": "number"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "type": {
+            "type": "string"
+          },
+          "isUser": {
+            "type": "boolean"
+          }
         }
       }
     },
@@ -99,10 +167,24 @@
       "params": {
         "type": "object",
         "properties": {
-          "entityId": { "type": "string" },
-          "status": { "type": "string", "enum": ["active", "paused", "revoked", "error"] },
-          "provider": { "type": "string" },
-          "limit": { "type": "number" }
+          "entityId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "revoked",
+              "error"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "number"
+          }
         }
       }
     },
@@ -112,9 +194,13 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId"],
+        "required": [
+          "sourceId"
+        ],
         "properties": {
-          "sourceId": { "type": "string" }
+          "sourceId": {
+            "type": "string"
+          }
         }
       }
     },
@@ -124,13 +210,42 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId"],
+        "required": [
+          "sourceId"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "label": { "type": "string" },
-          "status": { "type": "string", "enum": ["active", "paused", "revoked"] },
-          "defaultMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
-          "expectedCadence": { "type": "string", "enum": ["manual", "five_minutes", "ten_minutes", "daily", "live"] }
+          "sourceId": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "revoked"
+            ]
+          },
+          "defaultMode": {
+            "type": "string",
+            "enum": [
+              "backfill",
+              "incremental",
+              "live"
+            ]
+          },
+          "expectedCadence": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "five_minutes",
+              "ten_minutes",
+              "daily",
+              "live"
+            ]
+          }
         }
       }
     },
@@ -140,26 +255,70 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["installId", "clientDeviceId", "clientVersion", "providers"],
+        "required": [
+          "installId",
+          "clientDeviceId",
+          "clientVersion",
+          "providers"
+        ],
         "properties": {
-          "installId": { "type": "string" },
-          "clientDeviceId": { "type": "string" },
-          "hostname": { "type": "string" },
-          "platform": { "type": "string" },
-          "arch": { "type": "string" },
-          "osVersion": { "type": "string" },
-          "clientVersion": { "type": "string" },
-          "label": { "type": "string" },
-          "defaultMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
-          "expectedCadence": { "type": "string", "enum": ["manual", "five_minutes", "ten_minutes", "daily", "live"] },
+          "installId": {
+            "type": "string"
+          },
+          "clientDeviceId": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "arch": {
+            "type": "string"
+          },
+          "osVersion": {
+            "type": "string"
+          },
+          "clientVersion": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "defaultMode": {
+            "type": "string",
+            "enum": [
+              "backfill",
+              "incremental",
+              "live"
+            ]
+          },
+          "expectedCadence": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "five_minutes",
+              "ten_minutes",
+              "daily",
+              "live"
+            ]
+          },
           "providers": {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["provider", "enabled"],
+              "required": [
+                "provider",
+                "enabled"
+              ],
               "properties": {
-                "provider": { "type": "string" },
-                "enabled": { "type": "boolean" }
+                "provider": {
+                  "type": "string"
+                },
+                "enabled": {
+                  "type": "boolean"
+                }
               }
             }
           }
@@ -173,10 +332,25 @@
       "params": {
         "type": "object",
         "properties": {
-          "entityId": { "type": "string" },
-          "sourceId": { "type": "string" },
-          "status": { "type": "string", "enum": ["running", "completed", "completed_empty", "failed", "partial"] },
-          "limit": { "type": "number" }
+          "entityId": {
+            "type": "string"
+          },
+          "sourceId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "completed",
+              "completed_empty",
+              "failed",
+              "partial"
+            ]
+          },
+          "limit": {
+            "type": "number"
+          }
         }
       }
     },
@@ -186,9 +360,13 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["runId"],
+        "required": [
+          "runId"
+        ],
         "properties": {
-          "runId": { "type": "string" }
+          "runId": {
+            "type": "string"
+          }
         }
       }
     },
@@ -199,11 +377,21 @@
       "params": {
         "type": "object",
         "properties": {
-          "entityId": { "type": "string" },
-          "sourceId": { "type": "string" },
-          "provider": { "type": "string" },
-          "limit": { "type": "number" },
-          "cursor": { "type": "string" }
+          "entityId": {
+            "type": "string"
+          },
+          "sourceId": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "number"
+          },
+          "cursor": {
+            "type": "string"
+          }
         }
       }
     },
@@ -213,26 +401,65 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId", "clientRunId", "triggerKind", "runMode", "clientVersion"],
+        "required": [
+          "sourceId",
+          "clientRunId",
+          "triggerKind",
+          "runMode",
+          "clientVersion"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "clientRunId": { "type": "string" },
-          "triggerKind": { "type": "string", "enum": ["manual", "scheduled", "live", "resume"] },
-          "runMode": { "type": "string", "enum": ["backfill", "incremental", "live"] },
-          "clientVersion": { "type": "string" },
+          "sourceId": {
+            "type": "string"
+          },
+          "clientRunId": {
+            "type": "string"
+          },
+          "triggerKind": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "scheduled",
+              "live",
+              "resume"
+            ]
+          },
+          "runMode": {
+            "type": "string",
+            "enum": [
+              "backfill",
+              "incremental",
+              "live"
+            ]
+          },
+          "clientVersion": {
+            "type": "string"
+          },
           "providerSummary": {
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["provider", "sessionsSeen", "sessionsChanged"],
+              "required": [
+                "provider",
+                "sessionsSeen",
+                "sessionsChanged"
+              ],
               "properties": {
-                "provider": { "type": "string" },
-                "sessionsSeen": { "type": "number" },
-                "sessionsChanged": { "type": "number" }
+                "provider": {
+                  "type": "string"
+                },
+                "sessionsSeen": {
+                  "type": "number"
+                },
+                "sessionsChanged": {
+                  "type": "number"
+                }
               }
             }
           },
-          "checkpoint": { "type": "object" }
+          "checkpoint": {
+            "type": "object"
+          }
         }
       }
     },
@@ -242,22 +469,68 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId", "runId", "status", "sessionsSeen", "sessionsChanged", "imported", "upserted", "skipped", "failed", "bytesUploaded", "uploadCount"],
+        "required": [
+          "sourceId",
+          "runId",
+          "status",
+          "sessionsSeen",
+          "sessionsChanged",
+          "imported",
+          "upserted",
+          "skipped",
+          "failed",
+          "bytesUploaded",
+          "uploadCount"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "runId": { "type": "string" },
-          "status": { "type": "string", "enum": ["completed", "completed_empty", "failed", "partial"] },
-          "sessionsSeen": { "type": "number" },
-          "sessionsChanged": { "type": "number" },
-          "imported": { "type": "number" },
-          "upserted": { "type": "number" },
-          "skipped": { "type": "number" },
-          "failed": { "type": "number" },
-          "bytesUploaded": { "type": "number" },
-          "uploadCount": { "type": "number" },
-          "checkpoint": { "type": "object" },
-          "errorCode": { "type": "string" },
-          "errorMessage": { "type": "string" }
+          "sourceId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "completed_empty",
+              "failed",
+              "partial"
+            ]
+          },
+          "sessionsSeen": {
+            "type": "number"
+          },
+          "sessionsChanged": {
+            "type": "number"
+          },
+          "imported": {
+            "type": "number"
+          },
+          "upserted": {
+            "type": "number"
+          },
+          "skipped": {
+            "type": "number"
+          },
+          "failed": {
+            "type": "number"
+          },
+          "bytesUploaded": {
+            "type": "number"
+          },
+          "uploadCount": {
+            "type": "number"
+          },
+          "checkpoint": {
+            "type": "object"
+          },
+          "errorCode": {
+            "type": "string"
+          },
+          "errorMessage": {
+            "type": "string"
+          }
         }
       }
     },
@@ -267,16 +540,44 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId", "runId", "uploadId", "contentKind", "payloadSha256", "chunkTotal", "bytesTotal", "itemCount"],
+        "required": [
+          "sourceId",
+          "runId",
+          "uploadId",
+          "contentKind",
+          "payloadSha256",
+          "chunkTotal",
+          "bytesTotal",
+          "itemCount"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "runId": { "type": "string" },
-          "uploadId": { "type": "string" },
-          "contentKind": { "type": "string", "enum": ["sessions.batch"] },
-          "payloadSha256": { "type": "string" },
-          "chunkTotal": { "type": "number" },
-          "bytesTotal": { "type": "number" },
-          "itemCount": { "type": "number" }
+          "sourceId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "uploadId": {
+            "type": "string"
+          },
+          "contentKind": {
+            "type": "string",
+            "enum": [
+              "sessions.batch"
+            ]
+          },
+          "payloadSha256": {
+            "type": "string"
+          },
+          "chunkTotal": {
+            "type": "number"
+          },
+          "bytesTotal": {
+            "type": "number"
+          },
+          "itemCount": {
+            "type": "number"
+          }
         }
       }
     },
@@ -286,16 +587,44 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId", "runId", "uploadId", "chunkIndex", "chunkTotal", "payloadSha256", "encoding", "data"],
+        "required": [
+          "sourceId",
+          "runId",
+          "uploadId",
+          "chunkIndex",
+          "chunkTotal",
+          "payloadSha256",
+          "encoding",
+          "data"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "runId": { "type": "string" },
-          "uploadId": { "type": "string" },
-          "chunkIndex": { "type": "number" },
-          "chunkTotal": { "type": "number" },
-          "payloadSha256": { "type": "string" },
-          "encoding": { "type": "string", "enum": ["gzip+base64"] },
-          "data": { "type": "string" }
+          "sourceId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "uploadId": {
+            "type": "string"
+          },
+          "chunkIndex": {
+            "type": "number"
+          },
+          "chunkTotal": {
+            "type": "number"
+          },
+          "payloadSha256": {
+            "type": "string"
+          },
+          "encoding": {
+            "type": "string",
+            "enum": [
+              "gzip+base64"
+            ]
+          },
+          "data": {
+            "type": "string"
+          }
         }
       }
     },
@@ -305,11 +634,21 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId", "runId", "uploadId"],
+        "required": [
+          "sourceId",
+          "runId",
+          "uploadId"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "runId": { "type": "string" },
-          "uploadId": { "type": "string" }
+          "sourceId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "uploadId": {
+            "type": "string"
+          }
         }
       }
     },
@@ -319,13 +658,24 @@
       "access": "authenticated",
       "params": {
         "type": "object",
-        "required": ["sourceId", "runId", "uploadId"],
+        "required": [
+          "sourceId",
+          "runId",
+          "uploadId"
+        ],
         "properties": {
-          "sourceId": { "type": "string" },
-          "runId": { "type": "string" },
-          "uploadId": { "type": "string" }
+          "sourceId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "uploadId": {
+            "type": "string"
+          }
         }
       }
     }
-  }
+  },
+  "skill": "./SKILL.md"
 }
