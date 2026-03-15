@@ -2,7 +2,7 @@ export type OpenApiSchema = Record<string, unknown>;
 
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` });
 
-export const aixOpenApiComponents: Record<string, OpenApiSchema> = {
+export const appOpenApiComponents: Record<string, OpenApiSchema> = {
   CredentialSummary: {
     type: "object",
     required: ["id", "entityId", "label", "preset", "createdAt", "lastUsedAt", "expiresAt", "revokedAt"],
@@ -317,7 +317,7 @@ export const aixOpenApiComponents: Record<string, OpenApiSchema> = {
   },
 };
 
-export const aixResponseSchemasByMethod: Record<string, OpenApiSchema> = {
+export const appResponseSchemasByMethod: Record<string, OpenApiSchema> = {
   "aix.credentials.issue": {
     type: "object",
     required: ["ok", "credential", "token", "setupBundle"],

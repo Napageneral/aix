@@ -1,0 +1,3189 @@
+openapi: 3.1.0
+info:
+  title: AIX App API
+  version: 1.0.3
+  description: Collect, aggregate, and review AI session history from distributed
+    engineer devices.
+servers:
+  - url: https://{tenantId}.nexushub.sh
+    variables:
+      tenantId:
+        default: t-example
+tags:
+  - name: AIX
+paths:
+  /runtime/operations/aix.credentials.issue:
+    post:
+      operationId: aix.credentials.issue
+      summary: Issue an entity-bound AIX client token and setup bundle.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - entityId
+                - preset
+              properties:
+                entityId:
+                  type: string
+                preset:
+                  type: string
+                  enum:
+                    - offboarding
+                    - ongoing
+                label:
+                  type: string
+                expiresAt:
+                  type: number
+                providerAllowlist:
+                  type: array
+                  items:
+                    type: string
+                defaultMode:
+                  type: string
+                  enum:
+                    - backfill
+                    - incremental
+                    - live
+                defaultCadence:
+                  type: string
+                  enum:
+                    - manual
+                    - five_minutes
+                    - ten_minutes
+                    - daily
+                    - live
+                runtimeBaseUrl:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - credential
+                      - token
+                      - setupBundle
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      credential:
+                        $ref: "#/components/schemas/CredentialSummary"
+                      token:
+                        type: string
+                      setupBundle:
+                        $ref: "#/components/schemas/SetupBundle"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.credentials.list:
+    post:
+      operationId: aix.credentials.list
+      summary: List issued AIX client credentials.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                entityId:
+                  type: string
+                includeRevoked:
+                  type: boolean
+                includeExpired:
+                  type: boolean
+                limit:
+                  type: number
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - credentials
+                    properties:
+                      credentials:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/CredentialSummary"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.credentials.revoke:
+    post:
+      operationId: aix.credentials.revoke
+      summary: Revoke an issued AIX client credential.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - id
+              properties:
+                id:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - revoked
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      revoked:
+                        type: boolean
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.credentials.rotate:
+    post:
+      operationId: aix.credentials.rotate
+      summary: Rotate an issued AIX client credential.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - id
+              properties:
+                id:
+                  type: string
+                label:
+                  type: string
+                expiresAt:
+                  type: number
+                runtimeBaseUrl:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - previousId
+                      - credential
+                      - token
+                      - setupBundle
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      previousId:
+                        type: string
+                      credential:
+                        $ref: "#/components/schemas/CredentialSummary"
+                      token:
+                        type: string
+                      setupBundle:
+                        $ref: "#/components/schemas/SetupBundle"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.entities.list:
+    post:
+      operationId: aix.entities.list
+      summary: List candidate engineer entities for AIX token issuance.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit:
+                  type: number
+                offset:
+                  type: number
+                type:
+                  type: string
+                isUser:
+                  type: boolean
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - entities
+                    properties:
+                      entities:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/EntitySummary"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.imported-sessions.list:
+    post:
+      operationId: aix.imported-sessions.list
+      summary: List imported sessions written into the AIX archive workspace.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                entityId:
+                  type: string
+                sourceId:
+                  type: string
+                provider:
+                  type: string
+                limit:
+                  type: number
+                cursor:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - items
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/ImportedSession"
+                      nextCursor:
+                        type: string
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.runs.begin:
+    post:
+      operationId: aix.runs.begin
+      summary: Begin or resume an external AIX run.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+                - clientRunId
+                - triggerKind
+                - runMode
+                - clientVersion
+              properties:
+                sourceId:
+                  type: string
+                clientRunId:
+                  type: string
+                triggerKind:
+                  type: string
+                  enum:
+                    - manual
+                    - scheduled
+                    - live
+                    - resume
+                runMode:
+                  type: string
+                  enum:
+                    - backfill
+                    - incremental
+                    - live
+                clientVersion:
+                  type: string
+                providerSummary:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - provider
+                      - sessionsSeen
+                      - sessionsChanged
+                    properties:
+                      provider:
+                        type: string
+                      sessionsSeen:
+                        type: number
+                      sessionsChanged:
+                        type: number
+                checkpoint:
+                  type: object
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - run
+                      - existing
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      run:
+                        $ref: "#/components/schemas/RunStartSummary"
+                      existing:
+                        type: boolean
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.runs.complete:
+    post:
+      operationId: aix.runs.complete
+      summary: Complete an external AIX run and roll up source health.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+                - runId
+                - status
+                - sessionsSeen
+                - sessionsChanged
+                - imported
+                - upserted
+                - skipped
+                - failed
+                - bytesUploaded
+                - uploadCount
+              properties:
+                sourceId:
+                  type: string
+                runId:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                    - completed
+                    - completed_empty
+                    - failed
+                    - partial
+                sessionsSeen:
+                  type: number
+                sessionsChanged:
+                  type: number
+                imported:
+                  type: number
+                upserted:
+                  type: number
+                skipped:
+                  type: number
+                failed:
+                  type: number
+                bytesUploaded:
+                  type: number
+                uploadCount:
+                  type: number
+                checkpoint:
+                  type: object
+                errorCode:
+                  type: string
+                errorMessage:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - runId
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      runId:
+                        type: string
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.runs.get:
+    post:
+      operationId: aix.runs.get
+      summary: Get one AIX external run.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - runId
+              properties:
+                runId:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - run
+                      - uploads
+                    properties:
+                      run:
+                        $ref: "#/components/schemas/RunDetail"
+                      uploads:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/UploadRecord"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.runs.list:
+    post:
+      operationId: aix.runs.list
+      summary: List AIX external runs.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                entityId:
+                  type: string
+                sourceId:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                    - running
+                    - completed
+                    - completed_empty
+                    - failed
+                    - partial
+                limit:
+                  type: number
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - runs
+                    properties:
+                      runs:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/RunSummary"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.sources.get:
+    post:
+      operationId: aix.sources.get
+      summary: Get a single AIX source.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+              properties:
+                sourceId:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - source
+                      - device
+                      - providers
+                    properties:
+                      source:
+                        $ref: "#/components/schemas/SourceDetail"
+                      device:
+                        anyOf:
+                          - $ref: "#/components/schemas/DeviceSummary"
+                          - type: "null"
+                      providers:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/SourceProviderDetail"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.sources.list:
+    post:
+      operationId: aix.sources.list
+      summary: List AIX sources for the tenant.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                entityId:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                    - active
+                    - paused
+                    - revoked
+                    - error
+                provider:
+                  type: string
+                limit:
+                  type: number
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - sources
+                    properties:
+                      sources:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/SourceSummary"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.sources.register:
+    post:
+      operationId: aix.sources.register
+      summary: Register or reconnect an AIX install for the authenticated engineer.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - installId
+                - clientDeviceId
+                - clientVersion
+                - providers
+              properties:
+                installId:
+                  type: string
+                clientDeviceId:
+                  type: string
+                hostname:
+                  type: string
+                platform:
+                  type: string
+                arch:
+                  type: string
+                osVersion:
+                  type: string
+                clientVersion:
+                  type: string
+                label:
+                  type: string
+                defaultMode:
+                  type: string
+                  enum:
+                    - backfill
+                    - incremental
+                    - live
+                expectedCadence:
+                  type: string
+                  enum:
+                    - manual
+                    - five_minutes
+                    - ten_minutes
+                    - daily
+                    - live
+                providers:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - provider
+                      - enabled
+                    properties:
+                      provider:
+                        type: string
+                      enabled:
+                        type: boolean
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - source
+                      - runtime
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      source:
+                        type: object
+                        required:
+                          - id
+                          - entityId
+                          - installId
+                          - currentDeviceId
+                          - status
+                          - defaultMode
+                          - expectedCadence
+                        properties:
+                          id:
+                            type: string
+                          entityId:
+                            type: string
+                          installId:
+                            type: string
+                          currentDeviceId:
+                            type:
+                              - string
+                              - "null"
+                          status:
+                            type: string
+                            enum:
+                              - active
+                              - paused
+                              - revoked
+                              - error
+                          defaultMode:
+                            type: string
+                            enum:
+                              - backfill
+                              - incremental
+                              - live
+                          expectedCadence:
+                            type: string
+                            enum:
+                              - manual
+                              - five_minutes
+                              - ten_minutes
+                              - daily
+                              - live
+                      runtime:
+                        type: object
+                        required:
+                          - baseUrl
+                          - operationsPath
+                        properties:
+                          baseUrl:
+                            type: string
+                            format: uri
+                          operationsPath:
+                            type: string
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.sources.update:
+    post:
+      operationId: aix.sources.update
+      summary: Update source label or cadence settings.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+              properties:
+                sourceId:
+                  type: string
+                label:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                    - active
+                    - paused
+                    - revoked
+                defaultMode:
+                  type: string
+                  enum:
+                    - backfill
+                    - incremental
+                    - live
+                expectedCadence:
+                  type: string
+                  enum:
+                    - manual
+                    - five_minutes
+                    - ten_minutes
+                    - daily
+                    - live
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - sourceId
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      sourceId:
+                        type: string
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.uploads.begin:
+    post:
+      operationId: aix.uploads.begin
+      summary: Create or resume a resumable AIX upload.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+                - runId
+                - uploadId
+                - contentKind
+                - payloadSha256
+                - chunkTotal
+                - bytesTotal
+                - itemCount
+              properties:
+                sourceId:
+                  type: string
+                runId:
+                  type: string
+                uploadId:
+                  type: string
+                contentKind:
+                  type: string
+                  enum:
+                    - sessions.batch
+                payloadSha256:
+                  type: string
+                chunkTotal:
+                  type: number
+                bytesTotal:
+                  type: number
+                itemCount:
+                  type: number
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - upload
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      upload:
+                        $ref: "#/components/schemas/UploadSummary"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.uploads.chunk:
+    post:
+      operationId: aix.uploads.chunk
+      summary: Upload one resumable AIX payload chunk.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+                - runId
+                - uploadId
+                - chunkIndex
+                - chunkTotal
+                - payloadSha256
+                - encoding
+                - data
+              properties:
+                sourceId:
+                  type: string
+                runId:
+                  type: string
+                uploadId:
+                  type: string
+                chunkIndex:
+                  type: number
+                chunkTotal:
+                  type: number
+                payloadSha256:
+                  type: string
+                encoding:
+                  type: string
+                  enum:
+                    - gzip+base64
+                data:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - uploadId
+                      - status
+                      - receivedRanges
+                      - bytesReceived
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      uploadId:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - staging
+                          - completed
+                          - failed
+                      receivedRanges:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/UploadRange"
+                      bytesReceived:
+                        type: number
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.uploads.complete:
+    post:
+      operationId: aix.uploads.complete
+      summary: Finalize a resumable AIX upload into agents.db.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+                - runId
+                - uploadId
+              properties:
+                sourceId:
+                  type: string
+                runId:
+                  type: string
+                uploadId:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - uploadId
+                      - status
+                      - import
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      uploadId:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - completed
+                      import:
+                        $ref: "#/components/schemas/ImportStats"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+  /runtime/operations/aix.uploads.status:
+    post:
+      operationId: aix.uploads.status
+      summary: Get upload resume status for an AIX upload.
+      tags:
+        - AIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - sourceId
+                - runId
+                - uploadId
+              properties:
+                sourceId:
+                  type: string
+                runId:
+                  type: string
+                uploadId:
+                  type: string
+      responses:
+        "200":
+          description: Successful AIX method response
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - true
+                  payload:
+                    type: object
+                    required:
+                      - ok
+                      - uploadId
+                      - status
+                      - chunkTotal
+                      - receivedRanges
+                      - bytesReceived
+                    properties:
+                      ok:
+                        type: boolean
+                        enum:
+                          - true
+                      uploadId:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - missing
+                          - staging
+                          - completed
+                          - failed
+                      chunkTotal:
+                        anyOf:
+                          - type: number
+                          - type: "null"
+                      receivedRanges:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/UploadRange"
+                      bytesReceived:
+                        type: number
+                      result:
+                        $ref: "#/components/schemas/ImportStats"
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                  - error
+                properties:
+                  ok:
+                    type: boolean
+                    enum:
+                      - false
+                  error:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      message:
+                        type: string
+                      details:
+                        type:
+                          - array
+                          - "null"
+                        items:
+                          type: string
+                    required:
+                      - message
+                    additionalProperties: true
+                  meta:
+                    anyOf:
+                      - type: object
+                        additionalProperties: true
+                      - type: "null"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    UnauthorizedError:
+      type: object
+      required:
+        - ok
+        - error
+      properties:
+        ok:
+          type: boolean
+          enum:
+            - false
+        error:
+          type: string
+          enum:
+            - unauthorized
+            - not_authenticated
+    GenericError:
+      type: object
+      required:
+        - ok
+        - error
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+        detail:
+          type:
+            - string
+            - "null"
+    CredentialSummary:
+      type: object
+      required:
+        - id
+        - entityId
+        - label
+        - preset
+        - createdAt
+        - lastUsedAt
+        - expiresAt
+        - revokedAt
+      properties:
+        id:
+          type: string
+        entityId:
+          type: string
+        label:
+          type:
+            - string
+            - "null"
+        preset:
+          type: string
+          enum:
+            - offboarding
+            - ongoing
+        createdAt:
+          type: number
+        lastUsedAt:
+          type:
+            - number
+            - "null"
+        expiresAt:
+          type:
+            - number
+            - "null"
+        revokedAt:
+          type:
+            - number
+            - "null"
+    SetupBundle:
+      type: object
+      required:
+        - runtimeBaseUrl
+        - token
+        - commands
+        - promptText
+      properties:
+        runtimeBaseUrl:
+          type: string
+          format: uri
+        token:
+          type: string
+        commands:
+          type: array
+          items:
+            type: string
+        promptText:
+          type: string
+    EntitySummary:
+      type: object
+      required:
+        - id
+        - name
+        - type
+        - normalized
+        - isUser
+        - isAgent
+        - origin
+        - createdAt
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type:
+            - string
+            - "null"
+        normalized:
+          type:
+            - string
+            - "null"
+        isUser:
+          type: boolean
+        isAgent:
+          type: boolean
+        origin:
+          type:
+            - string
+            - "null"
+        createdAt:
+          type:
+            - number
+            - "null"
+    SourceProviderSummary:
+      type: object
+      required:
+        - provider
+        - enabled
+        - lastSeenAt
+      properties:
+        provider:
+          type: string
+        enabled:
+          type: boolean
+        lastSeenAt:
+          type: number
+    SourceProviderDetail:
+      type: object
+      required:
+        - provider
+        - enabled
+        - firstSeenAt
+        - lastSeenAt
+      properties:
+        provider:
+          type: string
+        enabled:
+          type: boolean
+        firstSeenAt:
+          type: number
+        lastSeenAt:
+          type: number
+    SourceHealth:
+      type: string
+      enum:
+        - healthy
+        - stale
+        - failed
+        - idle
+    SourceSummary:
+      type: object
+      required:
+        - id
+        - entityId
+        - installId
+        - currentDeviceId
+        - label
+        - status
+        - defaultMode
+        - expectedCadence
+        - lastSeenAt
+        - lastSuccessAt
+        - lastFailureAt
+        - lastRunId
+        - lastError
+        - clientVersion
+        - providers
+        - health
+      properties:
+        id:
+          type: string
+        entityId:
+          type: string
+        installId:
+          type: string
+        currentDeviceId:
+          type:
+            - string
+            - "null"
+        label:
+          type:
+            - string
+            - "null"
+        status:
+          type: string
+          enum:
+            - active
+            - paused
+            - revoked
+            - error
+        defaultMode:
+          type: string
+          enum:
+            - backfill
+            - incremental
+            - live
+        expectedCadence:
+          type: string
+          enum:
+            - manual
+            - five_minutes
+            - ten_minutes
+            - daily
+            - live
+        lastSeenAt:
+          type: number
+        lastSuccessAt:
+          type:
+            - number
+            - "null"
+        lastFailureAt:
+          type:
+            - number
+            - "null"
+        lastRunId:
+          type:
+            - string
+            - "null"
+        lastError:
+          type:
+            - string
+            - "null"
+        clientVersion:
+          type:
+            - string
+            - "null"
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceProviderSummary"
+        health:
+          $ref: "#/components/schemas/SourceHealth"
+    SourceDetail:
+      type: object
+      required:
+        - id
+        - entityId
+        - installId
+        - currentDeviceId
+        - label
+        - status
+        - defaultMode
+        - expectedCadence
+        - firstSeenAt
+        - lastSeenAt
+        - lastSuccessAt
+        - lastFailureAt
+        - lastRunId
+        - lastError
+        - clientVersion
+        - metadata
+      properties:
+        id:
+          type: string
+        entityId:
+          type: string
+        installId:
+          type: string
+        currentDeviceId:
+          type:
+            - string
+            - "null"
+        label:
+          type:
+            - string
+            - "null"
+        status:
+          type: string
+          enum:
+            - active
+            - paused
+            - revoked
+            - error
+        defaultMode:
+          type: string
+          enum:
+            - backfill
+            - incremental
+            - live
+        expectedCadence:
+          type: string
+          enum:
+            - manual
+            - five_minutes
+            - ten_minutes
+            - daily
+            - live
+        firstSeenAt:
+          type: number
+        lastSeenAt:
+          type: number
+        lastSuccessAt:
+          type:
+            - number
+            - "null"
+        lastFailureAt:
+          type:
+            - number
+            - "null"
+        lastRunId:
+          type:
+            - string
+            - "null"
+        lastError:
+          type:
+            - string
+            - "null"
+        clientVersion:
+          type:
+            - string
+            - "null"
+        metadata:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+    DeviceSummary:
+      type: object
+      required:
+        - id
+        - clientDeviceId
+        - hostname
+        - platform
+        - arch
+        - osVersion
+        - lastSeenAt
+      properties:
+        id:
+          type: string
+        clientDeviceId:
+          type: string
+        hostname:
+          type:
+            - string
+            - "null"
+        platform:
+          type:
+            - string
+            - "null"
+        arch:
+          type:
+            - string
+            - "null"
+        osVersion:
+          type:
+            - string
+            - "null"
+        lastSeenAt:
+          type:
+            - number
+            - "null"
+    RunStartSummary:
+      type: object
+      required:
+        - id
+        - sourceId
+        - entityId
+        - clientRunId
+        - status
+        - startedAt
+      properties:
+        id:
+          type: string
+        sourceId:
+          type: string
+        entityId:
+          type: string
+        clientRunId:
+          type: string
+        status:
+          type: string
+          enum:
+            - running
+            - completed
+            - completed_empty
+            - failed
+            - partial
+        startedAt:
+          type: number
+    RunSummary:
+      type: object
+      required:
+        - id
+        - sourceId
+        - entityId
+        - clientRunId
+        - triggerKind
+        - runMode
+        - status
+        - startedAt
+        - completedAt
+        - sessionsSeen
+        - sessionsChanged
+        - imported
+        - upserted
+        - skipped
+        - failed
+        - bytesUploaded
+        - uploadCount
+        - errorCode
+        - errorMessage
+      properties:
+        id:
+          type: string
+        sourceId:
+          type: string
+        entityId:
+          type: string
+        clientRunId:
+          type: string
+        triggerKind:
+          type: string
+          enum:
+            - manual
+            - scheduled
+            - live
+            - resume
+        runMode:
+          type: string
+          enum:
+            - backfill
+            - incremental
+            - live
+        status:
+          type: string
+          enum:
+            - running
+            - completed
+            - completed_empty
+            - failed
+            - partial
+        startedAt:
+          type: number
+        completedAt:
+          type:
+            - number
+            - "null"
+        sessionsSeen:
+          type: number
+        sessionsChanged:
+          type: number
+        imported:
+          type: number
+        upserted:
+          type: number
+        skipped:
+          type: number
+        failed:
+          type: number
+        bytesUploaded:
+          type: number
+        uploadCount:
+          type: number
+        errorCode:
+          type:
+            - string
+            - "null"
+        errorMessage:
+          type:
+            - string
+            - "null"
+    UploadRange:
+      type: object
+      required:
+        - start
+        - end
+      properties:
+        start:
+          type: number
+        end:
+          type: number
+    UploadRecord:
+      type: object
+      required:
+        - id
+        - runId
+        - sourceId
+        - status
+        - contentKind
+        - payloadSha256
+        - chunkTotal
+        - receivedRanges
+        - bytesReceived
+        - itemCount
+        - createdAt
+        - updatedAt
+        - completedAt
+        - errorCode
+        - errorMessage
+        - result
+      properties:
+        id:
+          type: string
+        runId:
+          type: string
+        sourceId:
+          type: string
+        status:
+          type: string
+          enum:
+            - staging
+            - completed
+            - failed
+        contentKind:
+          type: string
+        payloadSha256:
+          type: string
+        chunkTotal:
+          type: number
+        receivedRanges:
+          type: array
+          items:
+            $ref: "#/components/schemas/UploadRange"
+        bytesReceived:
+          type: number
+        itemCount:
+          type: number
+        createdAt:
+          type: number
+        updatedAt:
+          type: number
+        completedAt:
+          type:
+            - number
+            - "null"
+        errorCode:
+          type:
+            - string
+            - "null"
+        errorMessage:
+          type:
+            - string
+            - "null"
+        result:
+          type:
+            - object
+            - "null"
+          additionalProperties: true
+    RunDetail:
+      allOf:
+        - $ref: "#/components/schemas/RunSummary"
+        - type: object
+          required:
+            - checkpoint
+          properties:
+            checkpoint:
+              type:
+                - object
+                - "null"
+              additionalProperties: true
+    ImportStats:
+      type: object
+      required:
+        - imported
+        - upserted
+        - skipped
+        - failed
+      properties:
+        imported:
+          type: number
+        upserted:
+          type: number
+        skipped:
+          type: number
+        failed:
+          type: number
+    UploadSummary:
+      type: object
+      required:
+        - id
+        - status
+        - chunkTotal
+        - receivedRanges
+        - bytesReceived
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+        chunkTotal:
+          type: number
+        receivedRanges:
+          type: array
+          items:
+            $ref: "#/components/schemas/UploadRange"
+        bytesReceived:
+          type: number
+    ImportedSession:
+      type: object
+      required:
+        - sessionKey
+        - sourceEntityId
+        - aixSourceId
+        - sourceProvider
+        - sourceSessionId
+        - updatedAt
+        - title
+        - workspaceId
+      properties:
+        sessionKey:
+          type: string
+        sourceEntityId:
+          type: string
+        aixSourceId:
+          type: string
+        sourceProvider:
+          type: string
+        sourceSessionId:
+          type: string
+        updatedAt:
+          type: number
+        title:
+          type:
+            - string
+            - "null"
+        workspaceId:
+          type:
+            - string
+            - "null"
